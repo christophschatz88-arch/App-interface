@@ -37,7 +37,7 @@ def get_app_dir() -> Path:
 
 def get_update_dir() -> Path:
     """Get temporary directory for update downloads."""
-    update_dir = Path(tempfile.gettempdir()) / "lumina_update"
+    update_dir = Path(tempfile.gettempdir()) / "filect_update"
     
     # Clean up any existing directory to avoid permission issues
     if update_dir.exists():
@@ -47,7 +47,7 @@ def get_update_dir() -> Path:
             logger.warning(f"Could not clean update dir: {e}")
             # Try alternative directory with timestamp
             import time
-            update_dir = Path(tempfile.gettempdir()) / f"lumina_update_{int(time.time())}"
+            update_dir = Path(tempfile.gettempdir()) / f"filect_update_{int(time.time())}"
     
     update_dir.mkdir(exist_ok=True)
     return update_dir

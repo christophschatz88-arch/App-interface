@@ -35,6 +35,12 @@ STRIPE_PRICE_ID_STARTER = "price_1SeEv5BATYQXewwiQ5XO32PD"  # Starter plan
 STRIPE_PRICE_ID_ULTRA = "price_1SuJOxBATYQXewwiuqsqAcMJ"  # Ultra plan $49/month
 STRIPE_PRICE_ID = STRIPE_PRICE_ID_STARTER  # Default for checkout
 
+# Redirect URLs for authentication flows
+SITE_URL = "https://filect.io"
+REDIRECT_URL_SIGNUP = f"{SITE_URL}/signup-success"
+REDIRECT_URL_PASSWORD_RESET = f"{SITE_URL}/secret-reset-password"
+REDIRECT_URL_PAYMENT_SUCCESS = f"{SITE_URL}/payment-success"
+
 # Index limits per plan (images, videos, audio only - text files are unlimited)
 INDEX_LIMIT_STARTER = 1000   # 1000 media files per month for starter
 INDEX_LIMIT_ULTRA = 5000     # 5000 media files per month for ultra
@@ -137,7 +143,10 @@ class SupabaseAuth:
         try:
             response = self._auth_client.sign_up({
                 'email': email,
-                'password': password
+                'password': password,
+                'options': {
+                    'email_redirect_to': REDIRECT_URL_SIGNUP
+                }
             })
             
             if response.user:
@@ -219,7 +228,12 @@ class SupabaseAuth:
             return {'success': False, 'error': 'Supabase not available'}
         
         try:
-            self._auth_client.reset_password_for_email(email)
+            self._auth_client.reset_password_for_email(
+                email,
+                options={
+                    'redirect_to': REDIRECT_URL_PASSWORD_RESET
+                }
+            )
             logger.info(f"Password reset email sent to: {email}")
             return {'success': True}
         except Exception as e:
@@ -355,7 +369,7 @@ class SupabaseAuth:
         
         # Create checkout URL with user info
         # This will redirect to our Supabase Edge Function that creates a Stripe Checkout Session
-        checkout_url = f"{SUPABASE_URL}/functions/v1/create-checkout?user_id={user_id}&email={email}&price_id={checkout_price}"
+        checkout_url = f"{SUPABASE_URL}/functions/v1/create-checkout?user_id={user_id}&email={email}&price_id={checkout_price}&success_url={REDIRECT_URL_PAYMENT_SUCCESS}"
         
         try:
             webbrowser.open(checkout_url)
