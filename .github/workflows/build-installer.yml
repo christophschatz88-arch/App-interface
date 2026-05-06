@@ -21,6 +21,18 @@ jobs:
         with:
           python-version: '3.12'
       
+      - name: Validate semver tag
+        if: github.event_name == 'release'
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^[Vv]\.?', '' -replace '^\.', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            echo "ERROR: Version '$version' is not valid semver (expected X.Y.Z, e.g. 12.0.0)"
+            echo "Tags must be like v12.0.0, v12.1.0, etc."
+            exit 1
+          }
+          echo "Version '$version' is valid semver"
+        shell: pwsh
+
       - name: Update version from release tag
         if: github.event_name == 'release'
         run: |
