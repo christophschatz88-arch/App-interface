@@ -6785,7 +6785,7 @@ class OrganizePage(QWidget):
         
         # Update files_by_id with verified files only
         self.files_by_id = {f["id"]: f for f in files}
-        
+
         if not files:
             QMessageBox.warning(
                 self, "No Valid Files",
@@ -6793,7 +6793,16 @@ class OrganizePage(QWidget):
                 "Please re-index the folder to update the file list."
             )
             return
-        
+
+        # Attach subfolder context so the AI knows where each file currently lives.
+        # This enables "preserve folder X" instructions to work correctly.
+        for f in files:
+            try:
+                rel = Path(f["file_path"]).parent.relative_to(self.destination_path)
+                f["subfolder"] = str(rel) if str(rel) != "." else "."
+            except (ValueError, TypeError):
+                f["subfolder"] = "."
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.generate_button.setEnabled(False)
@@ -6801,7 +6810,7 @@ class OrganizePage(QWidget):
         self.status_label.setText(f"Asking AI to organize {len(files)} files...")
         self.plan_tree.clear()
         # Details panel removed
-        
+
         self.plan_worker = PlanWorker(instruction, files)
         self.plan_worker.finished.connect(self._on_plan_received)
         self.plan_worker.error.connect(self._on_plan_error)
@@ -7468,13 +7477,16 @@ Caption: {file_info.get('caption', 'none')}
             
             logger.info(f"Updated {paths_updated}/{len(self.current_moves)} file paths in database")
             
-            # Scan entire destination folder for empty folders (not just source folders)
-            empty_folders = self._scan_all_empty_folders()
-            
+            # Collect source folders (where files came from) and scan destination too
+            source_folders = {Path(m["source_path"]).parent for m in self.current_moves}
+            empty_from_sources = self._collect_empty_folders(source_folders)
+            empty_from_dest = self._scan_all_empty_folders()
+            all_empty = list({*empty_from_sources, *empty_from_dest})
+            all_empty.sort(key=lambda p: len(Path(p).parts), reverse=True)
+
             cleanup_msg = ""
-            if empty_folders:
-                # Show dialog for user to choose which folders to delete
-                removed_count = self._show_empty_folder_dialog(empty_folders)
+            if all_empty:
+                removed_count = self._delete_folders(all_empty)
                 if removed_count > 0:
                     cleanup_msg = f"\n\nDeleted {removed_count} empty folder(s)."
             
@@ -7750,16 +7762,16 @@ Caption: {file_info.get('caption', 'none')}
                 return
             
             try:
-                # Check if completely empty (no files, no subdirs)
-                contents = list(folder.iterdir())
-                if not contents:
+                _META = {'.DS_Store', '.localized', 'Thumbs.db', 'desktop.ini'}
+                real_contents = [p for p in folder.iterdir() if p.name not in _META]
+                if not real_contents:
                     empty_folders.append(str(folder))
                     logger.info(f"Found empty source folder: {folder}")
-                    
+
                     # Recursively check parent
                     check_folder_and_parents(folder.parent, min_depth)
                 else:
-                    logger.debug(f"Folder not empty ({len(contents)} items): {folder}")
+                    logger.debug(f"Folder not empty ({len(real_contents)} items): {folder}")
             except OSError as e:
                 logger.debug(f"Could not check folder {folder}: {e}")
             except Exception as e:
@@ -7802,9 +7814,9 @@ Caption: {file_info.get('caption', 'none')}
                     continue
                 
                 try:
-                    # Check if folder is completely empty
-                    contents = list(folder.iterdir())
-                    if not contents:
+                    _META = {'.DS_Store', '.localized', 'Thumbs.db', 'desktop.ini'}
+                    real_contents = [p for p in folder.iterdir() if p.name not in _META]
+                    if not real_contents:
                         empty_folders.append(str(folder))
                         logger.info(f"Found empty folder: {folder}")
                 except OSError as e:
@@ -7849,18 +7861,24 @@ Caption: {file_info.get('caption', 'none')}
         # Sort by depth (deepest first)
         sorted_paths = sorted(folder_paths, key=lambda p: len(Path(p).parts), reverse=True)
         
+        _METADATA_FILES = {'.DS_Store', '.localized', 'Thumbs.db', 'desktop.ini'}
+
         for folder_path in sorted_paths:
             try:
                 folder = Path(folder_path)
                 if folder.exists() and folder.is_dir():
-                    # Double-check it's still empty
-                    contents = list(folder.iterdir())
-                    if not contents:
+                    # Remove metadata files so they don't block deletion
+                    for meta in folder.iterdir():
+                        if meta.name in _METADATA_FILES and meta.is_file():
+                            meta.unlink(missing_ok=True)
+
+                    real_contents = [p for p in folder.iterdir() if p.name not in _METADATA_FILES]
+                    if not real_contents:
                         folder.rmdir()
                         deleted_count += 1
                         logger.info(f"Deleted empty folder: {folder}")
                     else:
-                        logger.warning(f"Folder no longer empty, skipping: {folder}")
+                        logger.warning(f"Folder not empty, skipping: {folder}")
             except OSError as e:
                 logger.warning(f"Could not delete folder {folder_path}: {e}")
             except Exception as e:

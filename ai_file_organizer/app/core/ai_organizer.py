@@ -33,6 +33,7 @@ SYSTEM_PROMPT = f"""You are a file organization assistant. Given a user's instru
 FILE INFORMATION PROVIDED:
 - id: unique file identifier (use this in your response)
 - name: the filename
+- folder: the current subfolder the file lives in (or "." if at the root level)
 - ext: the FILE EXTENSION (e.g., .mp4, .json, .png, .pdf) - USE THIS to identify file types!
 - label/tags/caption: AI-generated descriptions
 
@@ -52,6 +53,14 @@ STRICT RULES:
    - "audio" = .mp3, .wav, .m4a, .flac
 5. Maximum 2 folder levels
 6. Do NOT rename files - only organize into folders
+7. NEVER return empty folders - every folder must have at least one file
+
+PRESERVE INSTRUCTIONS (e.g., "keep X as is", "preserve folder X", "don't touch X", "leave X alone"):
+- Files inside the named folder must be OMITTED from the plan entirely — do NOT include their file_ids
+- Omitted files are left exactly where they are on disk — this is how preservation works
+- You can identify which files belong to a folder using the "folder" field
+- Example: "organize everything but preserve Work Projects" → include all files EXCEPT those with folder:"Work Projects"
+- Only omit files for folders the user explicitly names — organize everything else normally
 
 TWO MODES OF OPERATION:
 
@@ -64,7 +73,7 @@ MODE 1 - REGULAR ORGANIZE (instruction does NOT start with [AUTO-ORGANIZE]):
 MODE 2 - AUTO-ORGANIZE (instruction starts with [AUTO-ORGANIZE]):
 - Follow user's specific instructions EXACTLY for mentioned file types
 - ALSO organize ALL remaining files by their file type
-- EVERY file MUST be included - no file left out
+- EVERY file MUST be included - no file left out (unless user explicitly asks to preserve a folder)
 - Example: "screenshots to screenshots-folder" means:
   * Screenshots → "screenshots-folder" (as user specified)
   * Videos → "videos" (organized by type)
@@ -126,19 +135,19 @@ def build_file_summary(files: List[Dict[str, Any]], max_files: int = 300) -> str
         label = f.get('label', '') or ''
         caption = (f.get('caption', '') or '')[:80]
         tags = f.get('tags', []) or []
-        
+        subfolder = f.get('subfolder', '.') or '.'
+
         # Extract file extension for accurate type matching
         ext = ''
         if '.' in name:
             ext = name[name.rfind('.'):].lower()
-        
+
         # Add inferred hints from filename patterns
         hints = _infer_file_type_hints(name)
         all_tags = list(tags[:8]) + hints
         tags_str = ', '.join(all_tags) if all_tags else ''
-        
-        # Include extension prominently so AI can match file types
-        line = f"id:{fid} | {name} | ext:{ext} | label:{label} | tags:[{tags_str}]"
+
+        line = f"id:{fid} | {name} | folder:{subfolder} | ext:{ext} | label:{label} | tags:[{tags_str}]"
         if caption:
             line += f" | caption:{caption}"
         lines.append(line)

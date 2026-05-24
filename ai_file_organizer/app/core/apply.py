@@ -77,9 +77,14 @@ def apply_moves(move_plan: List[Dict[str, Any]]) -> Tuple[bool, List[str], str, 
                 
                 # Ensure source still exists
                 if not source_path.exists():
-                    error_msg = f"Source file no longer exists: {source_path}"
-                    errors.append(error_msg)
-                    logger.error(error_msg)
+                    if dest_path.exists():
+                        # File already reached its destination — treat as success
+                        successful_moves.append(move)
+                        logger.info(f"Already at destination, counting as success: {source_path.name}")
+                    else:
+                        error_msg = f"Source file no longer exists: {source_path}"
+                        errors.append(error_msg)
+                        logger.error(error_msg)
                     continue
                 
                 # Create destination directory if needed
