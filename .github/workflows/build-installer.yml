@@ -204,12 +204,14 @@ jobs:
         if: github.event_name == 'release'
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_BODY: ${{ github.event.release.body }}
         run: |
           # Remove V/v prefix and any leading dots (handles v1.0.0, V.1.0.0, 1.0.0)
           $version = "${{ github.ref_name }}" -replace '^[Vv]\.?', '' -replace '^\.', ''
-          $releaseName = "${{ github.event.release.name }}"
+          $releaseName = $env:RELEASE_NAME
           if ([string]::IsNullOrEmpty($releaseName)) { $releaseName = "Filect v$version" }
-          $releaseNotes = "${{ github.event.release.body }}" -replace '"', '\"' -replace "`r`n", ' ' -replace "`n", ' '
+          $releaseNotes = $env:RELEASE_BODY -replace '"', '\"' -replace "`r`n", ' ' -replace "`n", ' '
           
           # GitHub release URL (works when repo is public)
           $downloadUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/Filect-Setup-v$version.exe"
