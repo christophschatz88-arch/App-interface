@@ -34,6 +34,7 @@ class Settings:
         self.quick_search_geometry: Dict[str, int] = {}
         # Theme: 'dark' or 'light'
         self.theme: str = 'light'
+        self._theme_explicitly_set: bool = False
         # Auto-index downloads folder (legacy - kept for compatibility)
         self.auto_index_downloads: bool = False
         # Watch for new downloads - common folders (Downloads, Desktop, Documents, etc.)
@@ -273,10 +274,13 @@ class Settings:
         qsg = data.get('quick_search_geometry')
         if isinstance(qsg, dict):
             self.quick_search_geometry = {k: int(v) for k, v in qsg.items() if k in {'x','y','w','h'} and isinstance(v, (int, float, str))}
-        # Theme
+        # Theme — migrate existing users to light if they never explicitly chose dark
         theme = data.get('theme')
         if theme in ('dark', 'light'):
-            self.theme = theme
+            if theme == 'dark' and not data.get('theme_explicitly_set', False):
+                self.theme = 'light'  # one-time migration: default changed to light
+            else:
+                self.theme = theme
         # Auto-index downloads (legacy)
         self.auto_index_downloads = bool(data.get('auto_index_downloads', False))
         # Watch for new downloads - common folders
@@ -338,6 +342,7 @@ class Settings:
             'quick_search_auto_confirm': self.quick_search_auto_confirm,
             'quick_search_geometry': self.quick_search_geometry,
             'theme': self.theme,
+            'theme_explicitly_set': getattr(self, '_theme_explicitly_set', False),
             'auto_index_downloads': self.auto_index_downloads,
             'watch_common_folders': self.watch_common_folders,
             'watch_custom_folders': self.watch_custom_folders,
@@ -388,6 +393,7 @@ class Settings:
         """Set the application theme ('dark' or 'light')."""
         if theme in ('dark', 'light'):
             self.theme = theme
+            self._theme_explicitly_set = True
             self._save_config()
 
     def set_auto_index_downloads(self, enabled: bool) -> None:

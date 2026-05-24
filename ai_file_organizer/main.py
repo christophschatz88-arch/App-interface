@@ -13,20 +13,18 @@ from urllib.parse import urlparse, parse_qs
 
 # Handle PyInstaller bundled path vs running from source
 if hasattr(sys, '_MEIPASS'):
-    # Running as bundled exe - resources are in temp extraction folder
     project_root = Path(sys._MEIPASS)
     source_root = Path(sys._MEIPASS)
 else:
-    # Running from source
     project_root = Path(__file__).parent
     source_root = project_root
 
-# Add the project root to Python path for consistent imports
 sys.path.insert(0, str(project_root))
 
 from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from app.ui.main_window import MainWindow
 from app.ui.auth_dialog import AuthDialog
 from app.core.logging_config import setup_logging
@@ -35,6 +33,76 @@ from app.core.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# Unique name for the single-instance IPC socket
+_INSTANCE_KEY = "FilectApp-SingleInstance"
+
+
+# ---------------------------------------------------------------------------
+# Single-instance helpers
+# ---------------------------------------------------------------------------
+
+def _forward_to_existing_instance(message: str) -> bool:
+    """
+    Try to send a message to an already-running instance.
+    Returns True if the message was delivered (an instance was running).
+    """
+    socket = QLocalSocket()
+    socket.connectToServer(_INSTANCE_KEY)
+    if socket.waitForConnected(500):
+        socket.write(message.encode('utf-8'))
+        socket.flush()
+        socket.waitForBytesWritten(500)
+        socket.disconnectFromServer()
+        return True
+    return False
+
+
+def _setup_ipc_server(auth_dialog_holder: list, main_window_holder: list) -> QLocalServer:
+    """
+    Create the single-instance IPC server so future instances can forward
+    URLs to this (primary) instance.
+    """
+    QLocalServer.removeServer(_INSTANCE_KEY)
+    server = QLocalServer()
+    server.listen(_INSTANCE_KEY)
+
+    def _on_connection():
+        conn = server.nextPendingConnection()
+        if not conn:
+            return
+        conn.waitForReadyRead(500)
+        url = conn.readAll().data().decode('utf-8').strip()
+        conn.disconnectFromServer()
+        logger.info(f"IPC received from secondary instance: {url}")
+
+        if url.startswith('filect://verify'):
+            # Verify the email token in this (primary) instance
+            dlg = auth_dialog_holder[0]
+            handle_deep_link(url, dlg)
+        elif url.startswith('filect://'):
+            # Bring existing window to front
+            win = main_window_holder[0]
+            dlg = auth_dialog_holder[0]
+            target = win if (win and win.isVisible()) else dlg
+            if target:
+                target.show()
+                target.raise_()
+                target.activateWindow()
+                # Force Windows to actually foreground the window
+                try:
+                    import ctypes
+                    hwnd = int(target.winId())
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+
+    server.newConnection.connect(_on_connection)
+    return server
+
+
+# ---------------------------------------------------------------------------
+# URL scheme registration
+# ---------------------------------------------------------------------------
 
 def register_url_scheme():
     """Register filect:// URL scheme in the Windows Registry (HKCU, no admin needed)."""
@@ -42,13 +110,11 @@ def register_url_scheme():
         import winreg
         exe_path = sys.executable
 
-        # HKCU\Software\Classes\filect
         key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\filect")
         winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "URL:Filect Protocol")
         winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
         winreg.CloseKey(key)
 
-        # HKCU\Software\Classes\filect\shell\open\command
         cmd_key = winreg.CreateKey(
             winreg.HKEY_CURRENT_USER,
             r"Software\Classes\filect\shell\open\command"
@@ -58,17 +124,21 @@ def register_url_scheme():
 
         logger.info("filect:// URL scheme registered in Windows Registry")
     except ImportError:
-        pass  # Not on Windows
+        pass
     except Exception as e:
         logger.warning(f"Could not register URL scheme: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Deep link handler
+# ---------------------------------------------------------------------------
+
 def handle_deep_link(url: str, auth_dialog=None) -> bool:
     """
-    Handle a filect:// deep link passed via sys.argv on Windows.
+    Handle a filect:// deep link.
 
     filect://verify?token_hash=XXX&type=signup  — verify email and sign in
-    filect://open                                — no-op at launch (window shows normally)
+    filect://open                                — bring window to front (handled by IPC)
 
     Returns True if a verify action was attempted.
     """
@@ -94,7 +164,6 @@ def handle_deep_link(url: str, auth_dialog=None) -> bool:
                     tokens['refresh_token'],
                     supabase_auth.user_email or ''
                 )
-            # If auth dialog is open, trigger subscription check to close it
             if auth_dialog and auth_dialog.isVisible():
                 auth_dialog._check_subscription_silent()
             return True
@@ -104,6 +173,10 @@ def handle_deep_link(url: str, auth_dialog=None) -> bool:
 
     return False
 
+
+# ---------------------------------------------------------------------------
+# Session check
+# ---------------------------------------------------------------------------
 
 def check_existing_session():
     """
@@ -123,27 +196,37 @@ def check_existing_session():
         return False
 
     sub_result = supabase_auth.check_subscription()
-    if sub_result.get('has_subscription'):
-        return True
+    return sub_result.get('has_subscription', False)
 
-    return False
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     """Main application entry point."""
     setup_logging()
-
-    # Register filect:// URL scheme on Windows (safe to call every launch)
     register_url_scheme()
 
-    # Check for deep link URL passed as command-line argument (Windows URL scheme)
     deep_link_url = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].startswith('filect://') else None
 
-    # Create Qt application
     app = QApplication(sys.argv)
     app.setApplicationName("Filect")
     app.setApplicationVersion("1.0.0")
     app.setOrganizationName("Filect")
+
+    # If there's a deep link and an instance is already running, forward and exit.
+    # This is the key fix: "Open the App" brings the EXISTING window (with pre-filled
+    # email) to front instead of opening a blank new instance.
+    if deep_link_url and _forward_to_existing_instance(deep_link_url):
+        logger.info(f"Forwarded '{deep_link_url}' to existing instance — exiting")
+        sys.exit(0)
+
+    # We are the primary instance — set up IPC server for future launches.
+    # Use mutable holders so the server callback can reference objects created later.
+    auth_dialog_holder = [None]
+    main_window_holder = [None]
+    ipc_server = _setup_ipc_server(auth_dialog_holder, main_window_holder)  # noqa: F841
 
     # Set application icon
     icon_path = source_root / 'resources' / 'iconnn.ico'
@@ -159,7 +242,6 @@ def main():
     except Exception as e:
         print(f"Failed to apply theme: {e}")
 
-    # Check if Supabase is available
     if not SUPABASE_AVAILABLE:
         QMessageBox.warning(
             None,
@@ -168,15 +250,13 @@ def main():
         )
         sys.exit(1)
 
-    # Check for existing valid session BEFORE showing auth dialog
     has_valid_session = check_existing_session()
 
     if not has_valid_session:
         auth_dialog = AuthDialog()
+        auth_dialog_holder[0] = auth_dialog
 
-        # If a verify deep link was passed, handle it while the dialog is showing
         if deep_link_url and deep_link_url.startswith('filect://verify'):
-            from PySide6.QtCore import QTimer
             QTimer.singleShot(500, lambda: handle_deep_link(deep_link_url, auth_dialog))
 
         auth_result = auth_dialog.exec()
@@ -186,12 +266,11 @@ def main():
             if not sub_check.get('has_subscription'):
                 sys.exit(0)
     else:
-        # Already logged in — handle filect://open (window shows normally) or verify
         if deep_link_url:
             handle_deep_link(deep_link_url)
 
-    # Create and show main window
     window = MainWindow()
+    main_window_holder[0] = window
     window.show()
 
     sys.exit(app.exec())
