@@ -1915,32 +1915,44 @@ class MainWindow(QMainWindow):
         support_title.setStyleSheet(settings_title_style)
         support_layout.addWidget(support_title)
 
-        support_desc = QLabel("Experiencing an issue? Reach out and we'll help you out.")
+        support_desc = QLabel("Experiencing an issue? Email us directly:")
         support_desc.setStyleSheet(settings_hint_style)
         support_desc.setWordWrap(True)
         support_layout.addWidget(support_desc)
 
-        contact_btn = QPushButton("✉️ Contact Support")
-        contact_btn.setMinimumHeight(40)
-        contact_btn.setCursor(Qt.PointingHandCursor)
-        contact_btn.setStyleSheet("""
+        email_row = QHBoxLayout()
+        email_row.setSpacing(8)
+
+        email_label = QLabel("softwaregentofficial@gmail.com")
+        email_label.setStyleSheet("color: #7C4DFF; font-size: 13px; font-weight: 600; background: transparent; border: none;")
+        email_row.addWidget(email_label)
+
+        copy_btn = QPushButton("Copy")
+        copy_btn.setFixedHeight(28)
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
-                border: 1px solid rgba(124, 77, 255, 0.30);
-                border-radius: 10px;
+                border: 1px solid rgba(124, 77, 255, 0.40);
+                border-radius: 6px;
                 color: #7C4DFF;
-                font-size: 14px;
+                font-size: 12px;
                 font-weight: 600;
-                padding: 8px 16px;
+                padding: 4px 12px;
             }
             QPushButton:hover {
                 background-color: rgba(124, 77, 255, 0.08);
-                border-color: #7C4DFF;
             }
         """)
-        contact_btn.clicked.connect(lambda: __import__('webbrowser').open('mailto:softwaregentofficial@gmail.com?subject=Filect Support'))
-        support_layout.addWidget(contact_btn)
+        def _copy_email():
+            QApplication.clipboard().setText("softwaregentofficial@gmail.com")
+            copy_btn.setText("Copied!")
+            QTimer.singleShot(2000, lambda: copy_btn.setText("Copy"))
+        copy_btn.clicked.connect(_copy_email)
+        email_row.addWidget(copy_btn)
+        email_row.addStretch()
 
+        support_layout.addLayout(email_row)
         layout.addWidget(support_card)
 
         # AI Providers section removed - app covers AI costs for users
@@ -2426,7 +2438,8 @@ class MainWindow(QMainWindow):
         # ---- Card backgrounds (find by object name) ----
         from PySide6.QtWidgets import QFrame
         card_names = ['settingsCard', 'settingsCardHelp', 'settingsCardQS',
-                      'settingsCardSearch', 'settingsCardAccount', 'settingsCardExclusions']
+                      'settingsCardSearch', 'settingsCardAccount', 'settingsCardExclusions',
+                      'settingsCardSupport']
         for name in card_names:
             card = self.findChild(QFrame, name)
             if card:
