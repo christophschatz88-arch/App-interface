@@ -1892,7 +1892,57 @@ class MainWindow(QMainWindow):
         help_layout.addWidget(show_guide_btn)
         
         layout.addWidget(help_card)
-        
+
+        # ======= SUPPORT CARD =======
+        support_card = QFrame()
+        support_card.setObjectName("settingsCardSupport")
+        support_card.setStyleSheet("""
+            QFrame#settingsCardSupport {
+                background-color: #111119;
+                border: 1px solid #1C1C28;
+                border-radius: 16px;
+            }
+            QFrame#settingsCardSupport > QLabel {
+                border: none;
+                background: transparent;
+            }
+        """)
+        support_layout = QVBoxLayout(support_card)
+        support_layout.setContentsMargins(20, 20, 20, 20)
+        support_layout.setSpacing(12)
+
+        support_title = QLabel("💬 Support")
+        support_title.setStyleSheet(settings_title_style)
+        support_layout.addWidget(support_title)
+
+        support_desc = QLabel("Experiencing an issue? Reach out and we'll help you out.")
+        support_desc.setStyleSheet(settings_hint_style)
+        support_desc.setWordWrap(True)
+        support_layout.addWidget(support_desc)
+
+        contact_btn = QPushButton("✉️ Contact Support")
+        contact_btn.setMinimumHeight(40)
+        contact_btn.setCursor(Qt.PointingHandCursor)
+        contact_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid rgba(124, 77, 255, 0.30);
+                border-radius: 10px;
+                color: #7C4DFF;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(124, 77, 255, 0.08);
+                border-color: #7C4DFF;
+            }
+        """)
+        contact_btn.clicked.connect(lambda: __import__('webbrowser').open('mailto:softwaregentofficial@gmail.com?subject=Filect Support'))
+        support_layout.addWidget(contact_btn)
+
+        layout.addWidget(support_card)
+
         # AI Providers section removed - app covers AI costs for users
         # (Hidden placeholder widgets to prevent AttributeError in event handlers)
         self.local_ai_group = QFrame()
