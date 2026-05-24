@@ -594,6 +594,36 @@ class SupabaseAuth:
                 'reason': f'Index limit reached ({limit} files/month). Upgrade to Pro for more.'
             }
     
+    def verify_email_token(self, token_hash: str) -> Dict[str, Any]:
+        """
+        Verify a signup email using the token_hash from the filect://verify deep link.
+
+        Returns:
+            dict with 'success' bool and 'error' or 'user' keys
+        """
+        if not self._auth_client:
+            return {'success': False, 'error': 'Supabase not available'}
+
+        try:
+            response = self._auth_client.verify_otp({
+                'token_hash': token_hash,
+                'type': 'signup'
+            })
+
+            if response.user and response.session:
+                self._user = self._extract_user_dict(response.user)
+                self._session = self._extract_session_dict(response.session)
+                self._access_token = self._session.get('access_token')
+                logger.info(f"Email verified for: {self._user.get('email')}")
+                return {'success': True, 'user': self._user}
+            else:
+                return {'success': False, 'error': 'Verification failed'}
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Email verification error: {error_msg}")
+            return {'success': False, 'error': error_msg}
+
     def open_upgrade_checkout(self) -> bool:
         """Open checkout for upgrading to Ultra plan."""
         return self.open_checkout(price_id=STRIPE_PRICE_ID_ULTRA)

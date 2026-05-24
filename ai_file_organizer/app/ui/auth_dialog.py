@@ -1036,43 +1036,34 @@ class AuthDialog(QDialog):
     
     def _open_checkout(self):
         """Open Stripe checkout in browser and start polling."""
-        self.sub_status.setText("Opening checkout...")
         self.sub_status.setObjectName("statusLabel")
-        self.sub_status.setStyleSheet("")  # Reset any error styling
-        
+        self.sub_status.setStyleSheet("")
+
         success = supabase_auth.open_checkout()
-        
+
         if success:
-            self.sub_status.setText("Waiting for payment confirmation...")
-            self.subscribe_button.setEnabled(False)
-            self.subscribe_button.setText("Waiting...")
-            # Start polling
+            self.subscribe_button.setText("Open Checkout Again")
+            self.sub_status.setText("Complete payment in your browser — click above if the window closed.")
             self._poll_count = 0
             self._poll_timer.start(3000)
         else:
+            self.subscribe_button.setText("Subscribe Now")
             self.sub_status.setText("Failed to open checkout. Try again.")
             self.sub_status.setObjectName("errorLabel")
-    
+
     def _poll_subscription(self):
         """Poll for subscription status after checkout."""
         self._poll_count += 1
-        
-        # Stop after 100 attempts (5 minutes)
-        if self._poll_count > 100:
+
+        # Silent timeout after 30 minutes — reset button, stop polling
+        if self._poll_count > 600:
             self._poll_timer.stop()
-            self.subscribe_button.setEnabled(True)
             self.subscribe_button.setText("Subscribe Now")
-            self.sub_status.setText("Auto-check timed out. Click 'Subscribe Now' to try again.")
+            self.sub_status.setText("")
             return
-        
-        # Update status
-        remaining = (100 - self._poll_count) * 3
-        minutes = remaining // 60
-        seconds = remaining % 60
-        self.sub_status.setText(f"Checking payment status... ({minutes}:{seconds:02d})")
-        
+
         result = supabase_auth.check_subscription()
-        
+
         if result.get('has_subscription'):
             self._poll_timer.stop()
             self.sub_status.setText("Payment confirmed! 🎉")
