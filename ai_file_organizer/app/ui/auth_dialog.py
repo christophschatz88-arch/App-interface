@@ -566,7 +566,7 @@ class AuthDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Filect")
         self.setFixedSize(460, 680)
-        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         self.setModal(True)
         self.setObjectName("authDialog")
         
@@ -925,12 +925,14 @@ class AuthDialog(QDialog):
         self.title_label.setText("Create Account")
         self.subtitle_label.setText("Sign up to get started")
         self.stack.setCurrentIndex(1)
-    
+        self.setFixedSize(460, 760)
+
     def _go_to_login(self):
         """Navigate to login page."""
         self.title_label.setText("File Search Assistant")
         self.subtitle_label.setText("Sign in to your account")
         self.stack.setCurrentIndex(0)
+        self.setFixedSize(460, 680)
     
     def _try_restore_session(self):
         """Try to restore a previous session."""
@@ -1033,6 +1035,7 @@ class AuthDialog(QDialog):
         self.title_label.setText("Unlock Pro Features")
         self.subtitle_label.setText("Subscribe to access all features")
         self.stack.setCurrentIndex(2)
+        self.setFixedSize(460, 680)
     
     def _open_checkout(self):
         """Open Stripe checkout in browser and start polling."""

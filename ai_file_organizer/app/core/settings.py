@@ -33,7 +33,7 @@ class Settings:
         self.quick_search_auto_confirm: bool = True
         self.quick_search_geometry: Dict[str, int] = {}
         # Theme: 'dark' or 'light'
-        self.theme: str = 'dark'
+        self.theme: str = 'light'
         # Auto-index downloads folder (legacy - kept for compatibility)
         self.auto_index_downloads: bool = False
         # Watch for new downloads - common folders (Downloads, Desktop, Documents, etc.)
