@@ -80,6 +80,7 @@ jobs:
             "--collect-all", "PySide6",
             "--collect-all", "shiboken6",
             "--collect-all", "spellchecker",
+            "--collect-all", "sounddevice",
             "--collect-data", "spellchecker",
             "--collect-data", "certifi",
             "--add-data", "app/ui/styles.qss;app/ui",
