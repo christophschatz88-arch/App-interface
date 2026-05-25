@@ -57,6 +57,32 @@ DEFAULT_MODEL = get_vision_model()
 TEXT_MODEL = get_text_model()
 OPENAI_VISION_MODEL = get_openai_vision_model()
 
+USER_INSTRUCTIONS_TEMPLATE = """
+
+=== ADDITIONAL USER FOCUS ===
+The user has provided specific guidance for what they want emphasized in the analysis and tags.
+Their instructions: "{user_instructions}"
+
+IMPORTANT RULES FOR HANDLING USER INSTRUCTIONS:
+- You MUST still generate all standard tags (type, platform, subjects, objects, layout, style, colors, mood, branding, etc.)
+- In ADDITION to standard tags, pay special attention to the user's focus areas mentioned above
+- If the user mentions specific things to look for (e.g., "client names", "project codes", "invoice numbers", "brand names"), actively scan for these and include them as tags if they are visible in the content
+- If the user's focus areas are NOT visible or NOT applicable to this content, simply ignore them and proceed with standard analysis
+- The user's instructions should ENHANCE your tagging, not REPLACE your standard comprehensive analysis
+- Aim for 25-45 tags total, blending thorough standard analysis with the user's specific focus areas
+- If you find elements matching the user's focus, prioritize including those as tags
+"""
+
+
+def build_analysis_prompt(base_prompt: str, user_instructions: str = None) -> str:
+    """Build the full analysis prompt, optionally including user instructions."""
+    if user_instructions and user_instructions.strip():
+        clean = user_instructions.strip()[:500]
+        clean = clean.replace('"', "'")   # prevent prompt injection via quotes
+        clean = clean.replace('\n', ' ')  # flatten to single line
+        return base_prompt + USER_INSTRUCTIONS_TEMPLATE.format(user_instructions=clean)
+    return base_prompt
+
 SYSTEM_PROMPT = (
     "You are an on-device vision classifier. Output ONE JSON object ONLY (no markdown, no prose).\n"
     "Schema (strict):\n"
@@ -201,21 +227,21 @@ def _ensure_model(model: str = None) -> None:
     return None
 
 
-def analyze_image(image_path: Path, model: str = None) -> Optional[Dict[str, Any]]:
+def analyze_image(image_path: Path, model: str = None, user_instructions: str = None) -> Optional[Dict[str, Any]]:
     """Return label/tags/caption/confidence using configured AI provider.
-    
+
     Uses OpenAI by default (recommended). Falls back to local Ollama if configured.
     Returns None if no AI provider is available.
     """
     try:
         # Check which AI provider to use
         provider = settings.ai_provider
-        
+
         # OpenAI is the primary/default provider
         if provider == 'openai':
             image_b64 = _file_to_b64(image_path)
             if image_b64:
-                result = gpt_vision_fallback(image_b64, image_path.name)
+                result = gpt_vision_fallback(image_b64, image_path.name, user_instructions=user_instructions)
                 if result:
                     logger.info(f"OpenAI vision analysis successful for {image_path.name}")
                     return result
@@ -314,29 +340,30 @@ def analyze_image(image_path: Path, model: str = None) -> Optional[Dict[str, Any
         return None
 
 
-def _gpt_text_analysis(text: str, filename: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def _gpt_text_analysis(text: str, filename: Optional[str] = None, user_instructions: str = None) -> Optional[Dict[str, Any]]:
     """Analyze text content using OpenAI GPT."""
     try:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key or OpenAI is None:
             return None
-        
+
         client = OpenAI(api_key=api_key)
         name_part = f"Filename: {filename}\n" if filename else ""
         snippet = (text or "").strip()
         if len(snippet) > 5000:
             snippet = snippet[:5000]
-        
+
         user_prompt = (
             "Classify the following file content. Return STRICT JSON only.\n"
             + name_part
             + "Content snippet:\n" + snippet
         )
-        
+
+        system = build_analysis_prompt(SYSTEM_PROMPT, user_instructions)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",  # Cost-effective for text
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,
@@ -375,7 +402,7 @@ def _gpt_text_analysis(text: str, filename: Optional[str] = None) -> Optional[Di
         return None
 
 
-def analyze_text(text: str, filename: Optional[str] = None, model: str = None) -> Optional[Dict[str, Any]]:
+def analyze_text(text: str, filename: Optional[str] = None, model: str = None, user_instructions: str = None) -> Optional[Dict[str, Any]]:
     """Classify non-image files using configured AI provider.
 
     Uses OpenAI by default (recommended). Falls back to local Ollama if configured.
@@ -383,10 +410,10 @@ def analyze_text(text: str, filename: Optional[str] = None, model: str = None) -
     """
     try:
         provider = settings.ai_provider
-        
+
         # OpenAI is the primary/default provider
         if provider == 'openai':
-            result = _gpt_text_analysis(text, filename)
+            result = _gpt_text_analysis(text, filename, user_instructions=user_instructions)
             if result:
                 logger.info(f"OpenAI text analysis successful for {filename or 'unknown'}")
                 return result
@@ -552,7 +579,7 @@ def _salvage_from_content(content: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def gpt_vision_fallback(image_b64: str, filename: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def gpt_vision_fallback(image_b64: str, filename: Optional[str] = None, user_instructions: str = None) -> Optional[Dict[str, Any]]:
     """Cloud fallback using OpenAI GPT-4o-mini if OPENAI_API_KEY is set.
     image_b64 should be raw base64 without data URI prefix.
     """
@@ -561,7 +588,7 @@ def gpt_vision_fallback(image_b64: str, filename: Optional[str] = None) -> Optio
         if not api_key or OpenAI is None:
             return None
         client = OpenAI(api_key=api_key)
-        system = DETAILED_SYSTEM_PROMPT
+        system = build_analysis_prompt(DETAILED_SYSTEM_PROMPT, user_instructions)
         # Build data URL for inline base64 image
         data_url = f"data:image/png;base64,{image_b64}"
         user_content: List[Dict[str, Any]] = []

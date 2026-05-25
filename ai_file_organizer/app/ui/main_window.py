@@ -4735,8 +4735,9 @@ Move Plan Summary:
         self._update_queue_ui()
         self.status_bar.showMessage("Queue cleared")
     
-    def _start_indexing_path(self, path: Path):
+    def _start_indexing_path(self, path: Path, user_instructions: str = None):
         """Start indexing a specific path."""
+        self._current_user_instructions = user_instructions
         self.is_indexing = True
         self.index_path = path
         self.index_label.setText(f"Indexing: {path.name}")
@@ -4794,9 +4795,10 @@ Move Plan Summary:
                     raise InterruptedError("Indexing cancelled by user")
 
         # Monkey-patch run to inject callback without refactor
+        current_instructions = self._current_user_instructions
         def run_with_progress():
             try:
-                result = search_service.index_directory(self.index_path, progress_cb=progress_cb)
+                result = search_service.index_directory(self.index_path, progress_cb=progress_cb, user_instructions=current_instructions)
                 self.index_worker.index_completed.emit(result)
             except Exception as e:
                 self.index_worker.index_error.emit(str(e))
@@ -6880,12 +6882,12 @@ Move Plan Summary:
         confirm_dialog = QDialog(self)
         confirm_dialog.setWindowTitle("Index Files")
         confirm_dialog.setModal(True)
-        confirm_dialog.setFixedSize(400, 200)
-        
+        confirm_dialog.setFixedSize(400, 320)
+
         # Center on parent
         confirm_dialog.move(
             self.x() + (self.width() - 400) // 2,
-            self.y() + (self.height() - 200) // 2
+            self.y() + (self.height() - 320) // 2
         )
         
         # Style the entire dialog
@@ -6922,9 +6924,42 @@ Move Plan Summary:
         sub_label = QLabel("Files will be scanned and made searchable.")
         sub_label.setStyleSheet(f"color: {c['text_muted']}; font-size: 13px; background: transparent;")
         dialog_layout.addWidget(sub_label)
-        
+
+        # Optional instructions
+        instructions_header = QLabel("Custom AI Instructions (Optional)")
+        instructions_header.setStyleSheet(f"""
+            color: {c['text']};
+            font-size: 13px;
+            font-weight: 600;
+            background: transparent;
+            margin-top: 4px;
+        """)
+        dialog_layout.addWidget(instructions_header)
+
+        instructions_input = QPlainTextEdit()
+        instructions_input.setPlaceholderText(
+            "Guide the AI about what to focus on when generating tags...\n"
+            "e.g., 'Look for client names, project codes, invoice numbers'"
+        )
+        instructions_input.setMaximumHeight(80)
+        instructions_input.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {c['input_bg']};
+                border: 1px solid {c['border']};
+                border-radius: 10px;
+                padding: 10px;
+                color: {c['text']};
+                font-size: 13px;
+            }}
+            QPlainTextEdit:focus {{
+                border-color: #7C4DFF;
+                border-width: 2px;
+            }}
+        """)
+        dialog_layout.addWidget(instructions_input)
+
         dialog_layout.addStretch()
-        
+
         # Button row
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
@@ -6982,11 +7017,13 @@ Move Plan Summary:
         
         if confirm_dialog.exec() != QDialog.Accepted:
             return
-        
+
+        user_instructions = instructions_input.toPlainText().strip() or None
+
         # Index folders
         if folders_to_index:
             if self.is_indexing:
-                # Add all to queue
+                # Add all to queue (instructions apply to current batch only)
                 for folder in folders_to_index:
                     self._add_to_index_queue(folder)
             else:
@@ -6997,16 +7034,16 @@ Move Plan Summary:
                 self.index_path = first
                 self.index_label.setText(f"Index folder: {first}")
                 self.index_button_action.setEnabled(True)
-                self._start_indexing_path(first)
-        
+                self._start_indexing_path(first, user_instructions=user_instructions)
+
         # Index individual files
         if files_to_index and not folders_to_index:
-            self._index_individual_files(files_to_index)
+            self._index_individual_files(files_to_index, user_instructions=user_instructions)
     
-    def _index_individual_files(self, files: list):
+    def _index_individual_files(self, files: list, user_instructions: str = None):
         """Index individual dropped files."""
         from app.core.search import search_service
-        
+
         total = len(files)
         
         # Show progress container
@@ -7024,7 +7061,7 @@ Move Plan Summary:
         indexed = 0
         for file_path in files:
             try:
-                result = search_service.index_single_file(file_path)
+                result = search_service.index_single_file(file_path, user_instructions=user_instructions)
                 if not result.get('error'):
                     indexed += 1
                 percent = int((indexed / total) * 100)

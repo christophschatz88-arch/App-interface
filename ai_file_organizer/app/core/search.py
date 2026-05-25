@@ -139,7 +139,7 @@ class SearchService:
             time.sleep(0.1)
         return not self._cancel_flag.is_set()
     
-    def _process_single_file(self, file_data: Dict, directory_path: Path, force_ai: bool = False) -> Dict[str, Any]:
+    def _process_single_file(self, file_data: Dict, directory_path: Path, force_ai: bool = False, user_instructions: str = None) -> Dict[str, Any]:
         """
         Process a single file with AI analysis. Called in parallel.
         
@@ -194,7 +194,7 @@ class SearchService:
                     from .vision import _file_to_b64
                     image_b64 = _file_to_b64(file_path)
                     if image_b64:
-                        gptv = gpt_vision_fallback(image_b64, filename=file_path.name)
+                        gptv = gpt_vision_fallback(image_b64, filename=file_path.name, user_instructions=user_instructions)
                         if gptv:
                             full_metadata.update(gptv)
                             full_metadata['ai_source'] = f'openai:{settings.openai_vision_model}'
@@ -205,13 +205,13 @@ class SearchService:
                     if use_detailed:
                         vision = describe_image_detailed(file_path)
                     if not vision or not vision.get('caption'):
-                        vision = analyze_image(file_path)
+                        vision = analyze_image(file_path, user_instructions=user_instructions)
                     if not vision or not vision.get('caption'):
                         # Fallback to cloud
                         from .vision import _file_to_b64
                         image_b64 = _file_to_b64(file_path)
                         if image_b64:
-                            gptv = gpt_vision_fallback(image_b64, filename=file_path.name)
+                            gptv = gpt_vision_fallback(image_b64, filename=file_path.name, user_instructions=user_instructions)
                             if gptv:
                                 vision = gptv
                                 full_metadata['ai_source'] = f'openai:{settings.openai_vision_model}'
@@ -234,9 +234,9 @@ class SearchService:
                             snippet = fh.read(8000)
                 except Exception:
                     snippet = ""
-                
+
                 if snippet:
-                    tvision = analyze_text(snippet, filename=file_path.name)
+                    tvision = analyze_text(snippet, filename=file_path.name, user_instructions=user_instructions)
                     if tvision:
                         full_metadata.update(tvision)
                         if settings.ai_provider == 'openai':
@@ -256,14 +256,15 @@ class SearchService:
                 'source_path': file_data.get('source_path', ''),
             }
     
-    def index_single_file(self, file_path: Path, force_ai: bool = False) -> Dict[str, Any]:
+    def index_single_file(self, file_path: Path, force_ai: bool = False, user_instructions: str = None) -> Dict[str, Any]:
         """
         Index a single file with AI analysis.
-        
+
         Args:
             file_path: Path to the file to index
             force_ai: Force re-analysis even if file hasn't changed
-            
+            user_instructions: Optional focus instructions for AI tag generation
+
         Returns:
             Dictionary with result info (or 'error' key on failure)
         """
@@ -293,7 +294,7 @@ class SearchService:
             }
             
             # Process the file with AI
-            result = self._process_single_file(file_data, file_path.parent, force_ai=force_ai)
+            result = self._process_single_file(file_data, file_path.parent, force_ai=force_ai, user_instructions=user_instructions)
             
             # Handle errors
             file_path_result = result.pop('_file_path', None)
@@ -349,6 +350,7 @@ class SearchService:
         directory_path: Path,
         recursive: bool = True,
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        user_instructions: str = None,
     ) -> Dict[str, Any]:
         """
         Index all files in a directory for search using parallel processing.
@@ -412,7 +414,7 @@ class SearchService:
             with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_AI_REQUESTS) as executor:
                 # Submit all tasks
                 future_to_idx = {
-                    executor.submit(self._process_single_file, file_data, directory_path): idx
+                    executor.submit(self._process_single_file, file_data, directory_path, False, user_instructions): idx
                     for idx, file_data in enumerate(files)
                 }
                 
