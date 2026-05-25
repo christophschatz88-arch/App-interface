@@ -4618,9 +4618,9 @@ class WatchConfigDialog(QDialog):
             settings._save_config()
             logger.info("Settings saved")
             
-            # Apply actions if watcher is running
+            # Apply actions regardless of whether watcher is currently running
             parent = self.parent()
-            if parent and hasattr(parent, 'auto_watcher') and parent.auto_watcher and parent.auto_watcher.is_running:
+            if parent and hasattr(parent, 'auto_watcher') and parent.auto_watcher:
                 for folder_path, action in folders_to_apply:
                     logger.info(f"Applying action {action} to folder: {folder_path}")
                     if action == ApplyInstructionsDialogSingleFolder.REORGANIZE_ALL:
