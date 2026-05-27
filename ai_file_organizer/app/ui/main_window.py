@@ -530,7 +530,28 @@ class MainWindow(QMainWindow):
         
         nav_layout.addStretch()
         sidebar_layout.addWidget(nav_container, 1)  # Takes remaining space
-        
+
+        # Upgrade button — sits just above the profile card. Shown only for
+        # Basic/Pro (hidden for Premium and when not signed in). Set in
+        # refresh_account_info() based on the user's tier.
+        upgrade_wrap = QWidget()
+        upgrade_wrap_layout = QVBoxLayout(upgrade_wrap)
+        upgrade_wrap_layout.setContentsMargins(12, 0, 12, 4)
+        self.upgrade_button = QPushButton("⬆  Upgrade plan")
+        self.upgrade_button.setObjectName("sidebarUpgradeButton")
+        self.upgrade_button.setCursor(Qt.PointingHandCursor)
+        self.upgrade_button.setMinimumHeight(38)
+        self.upgrade_button.setStyleSheet(
+            "QPushButton#sidebarUpgradeButton {"
+            "  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #B28BFF, stop:1 #6D28D9);"
+            "  color: #ffffff; border: none; border-radius: 9px; font-weight: 600; font-size: 13px; }"
+            "QPushButton#sidebarUpgradeButton:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #BE9BFF, stop:1 #7C3AED); }"
+        )
+        self.upgrade_button.clicked.connect(lambda: supabase_auth.open_web_pricing())
+        self.upgrade_button.setVisible(False)
+        upgrade_wrap_layout.addWidget(self.upgrade_button)
+        sidebar_layout.addWidget(upgrade_wrap)
+
         # Account section at bottom
         account_container = QWidget()
         account_container.setObjectName("accountContainer")
@@ -2193,7 +2214,25 @@ class MainWindow(QMainWindow):
         """)
         self.manage_sub_btn.clicked.connect(self._open_billing_portal)
         button_row.addWidget(self.manage_sub_btn)
-        
+
+        # Cancel subscription -> opens the web retention/cancel flow (reason ->
+        # 50% off -> cancel). Kept low-prominence (text link style).
+        self.cancel_sub_btn = QPushButton("Cancel subscription")
+        self.cancel_sub_btn.setMinimumHeight(36)
+        self.cancel_sub_btn.setCursor(Qt.PointingHandCursor)
+        self.cancel_sub_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                color: #7A7A90;
+                font-weight: 500;
+                text-decoration: underline;
+            }
+            QPushButton:hover { color: #FF6B6B; }
+        """)
+        self.cancel_sub_btn.clicked.connect(self._open_cancel_flow)
+        button_row.addWidget(self.cancel_sub_btn)
+
         self.signout_btn = QPushButton("Sign Out")
         self.signout_btn.setMinimumHeight(36)
         self.signout_btn.setMinimumWidth(100)
@@ -2591,20 +2630,27 @@ class MainWindow(QMainWindow):
                 
                 if result.get('has_subscription'):
                     status = result.get('status', 'active')
+                    tier = supabase_auth.get_plan_tier()
+                    plan_disp = {'basic': 'Basic', 'pro': 'Pro', 'premium': 'Premium'}.get(tier, 'Pro')
+                    # "Free trial until …" while trialing, otherwise "Active until …".
+                    state_word = 'Free trial' if status == 'trialing' else 'Active'
                     expires_at = result.get('expires_at', 'N/A')
+                    expires_str = None
                     if expires_at and expires_at != 'N/A':
                         try:
-                            # Format the date nicely
                             dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
                             expires_str = dt.strftime('%Y-%m-%d')
-                            self.account_sub_label.setText(f"✓ Active (until {expires_str})")
                         except Exception:
-                            self.account_sub_label.setText(f"✓ Active ({status})")
+                            expires_str = None
+                    if expires_str:
+                        self.account_sub_label.setText(f"✓ {plan_disp} · {state_word} until {expires_str}")
                     else:
-                        self.account_sub_label.setText(f"✓ Active ({status})")
+                        self.account_sub_label.setText(f"✓ {plan_disp} · {state_word}")
                     self.account_sub_label.setStyleSheet("color: #7C4DFF;")
-                    self.account_plan_label.setText("Pro Plan ✓")
+                    self.account_plan_label.setText(f"{plan_disp} Plan ✓")
                     self.account_plan_label.setStyleSheet("color: #7C4DFF; font-weight: 500;")
+                    # Upgrade button: show for Basic/Pro, hide for Premium (top tier).
+                    self.upgrade_button.setVisible(tier in ('basic', 'pro'))
                 else:
                     status = result.get('status')
                     if status:
@@ -2614,6 +2660,7 @@ class MainWindow(QMainWindow):
                     self.account_sub_label.setStyleSheet("color: #FF6B6B;")
                     self.account_plan_label.setText("Free Plan")
                     self.account_plan_label.setStyleSheet("")
+                    self.upgrade_button.setVisible(False)
             else:
                 logger.info("[ACCOUNT] User not authenticated")
                 self.account_email_label.setText("Not logged in")
@@ -2624,6 +2671,7 @@ class MainWindow(QMainWindow):
                 self.account_plan_label.setText("Sign in to continue")
                 self.account_plan_label.setStyleSheet("color: #7A7A90;")
                 self.avatar_label.setText("?")
+                self.upgrade_button.setVisible(False)
         except Exception as e:
             logger.error(f"[ACCOUNT] Error refreshing account info: {e}")
         
@@ -2667,7 +2715,33 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Error opening billing portal: {e}")
             ModernInfoDialog.show_warning(self, "Error", "Could not open billing portal. Please try again.")
-    
+
+    def _open_cancel_flow(self):
+        """Open the web cancellation/retention flow (reason -> 50% off -> cancel)."""
+        import webbrowser
+        from urllib.parse import quote
+        from app.core.supabase_client import supabase_auth
+        from app.ui.organize_page import ModernInfoDialog
+
+        if not supabase_auth.is_authenticated:
+            ModernInfoDialog.show_warning(self, "Not Logged In", "Please sign in to manage your subscription.")
+            return
+
+        current_user = supabase_auth.current_user or {}
+        user_id = current_user.get('id', '')
+        email = current_user.get('email', '')
+        if not user_id:
+            ModernInfoDialog.show_warning(self, "Error", "Could not retrieve account info. Please try signing out and back in.")
+            return
+
+        url = f"https://filect.io/cancel?uid={user_id}&email={quote(email)}&source=app"
+        try:
+            webbrowser.open(url)
+            self.status_bar.showMessage("Opening cancellation in your browser...", 3000)
+        except Exception as e:
+            logger.error(f"Error opening cancel flow: {e}")
+            ModernInfoDialog.show_warning(self, "Error", "Could not open the cancellation page. Please try again.")
+
     def _rebuild_fts_index(self):
         """Rebuild the FTS search index to fix corruption."""
         from app.ui.organize_page import ModernConfirmDialog, ModernInfoDialog
@@ -4987,39 +5061,38 @@ Move Plan Summary:
     def _show_upgrade_dialog(self, limit_info: dict):
         """Show upgrade dialog when index limit is reached."""
         from app.ui.organize_page import ModernConfirmDialog, ModernInfoDialog
-        from app.core.supabase_client import supabase_auth, INDEX_LIMIT_STARTER, INDEX_LIMIT_ULTRA
-        
+        from app.core.supabase_client import supabase_auth, INDEX_LIMIT_PREMIUM
+
         remaining = limit_info.get('remaining', 0)
-        limit = limit_info.get('limit', INDEX_LIMIT_STARTER)
-        plan = limit_info.get('plan', 'starter')
-        
-        if plan == 'ultra':
-            # Ultra users hit their 5000 limit - no upgrade available
+        plan = limit_info.get('plan') or supabase_auth.get_plan_tier()
+        limit = limit_info.get('limit') or supabase_auth.get_index_limit()
+
+        if plan == 'premium':
+            # Premium is the top tier - no upgrade available
             ModernInfoDialog.show_info(
                 self,
                 title="Index Limit Reached",
-                message=f"You've reached your Ultra plan limit of {INDEX_LIMIT_ULTRA} media files this month.",
+                message=f"You've reached your Premium plan limit of {INDEX_LIMIT_PREMIUM:,} media files this month.",
                 details=[
                     "Your limit will reset at the start of your next billing cycle.",
                     "Text files are unlimited and can still be indexed."
                 ]
             )
         else:
-            # Starter users - offer upgrade to Ultra
+            # Basic / Pro users - offer to upgrade (plan selection happens on the web)
             confirmed = ModernConfirmDialog.ask(
                 self,
                 title="Index Limit Reached",
-                message=f"You've reached your monthly limit of {limit} media files.",
-                info_text=f"Upgrade to Ultra for {INDEX_LIMIT_ULTRA} media files per month!",
+                message=f"You've reached your monthly limit of {limit:,} media files. Search and organize still work — upgrade to index more.",
+                info_text="Upgrade your plan for a higher monthly limit.",
                 highlight_text=f"Current plan: {plan.title()} | Used: {limit - remaining}/{limit}",
-                yes_text="Upgrade to Ultra ($49/mo)",
+                yes_text="See plans",
                 no_text="Maybe Later"
             )
-            
+
             if confirmed:
-                # Open upgrade checkout
-                supabase_auth.open_upgrade_checkout()
-                self.status_bar.showMessage("Opening upgrade checkout...", 5000)
+                supabase_auth.open_web_pricing()
+                self.status_bar.showMessage("Opening plans in your browser...", 5000)
     
     def on_index_error(self, error: str):
         """Handle index error."""
@@ -7114,16 +7187,16 @@ Move Plan Summary:
     def _update_usage_labels(self):
         """Update the usage indicator labels (main tab and overlay)."""
         try:
-            from app.core.supabase_client import supabase_auth, INDEX_LIMIT_STARTER, INDEX_LIMIT_ULTRA
-            
+            from app.core.supabase_client import supabase_auth
+
             # Get current usage
             usage = supabase_auth.get_index_usage()
             plan = supabase_auth.get_plan_tier()
-            
+
             if plan == 'free':
                 usage_text = "Sign in to track media indexing"
             else:
-                limit = INDEX_LIMIT_ULTRA if plan == 'ultra' else INDEX_LIMIT_STARTER
+                limit = supabase_auth.get_index_limit()
                 count = usage.get('count', 0)
                 remaining = max(0, limit - count)
                 usage_text = f"{count:,} / {limit:,} media files indexed • {remaining:,} remaining"

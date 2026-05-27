@@ -3,9 +3,10 @@ Supabase client for authentication and subscription management.
 Uses individual packages (supabase-auth, postgrest) instead of full supabase package.
 """
 
+import calendar
 import logging
 import webbrowser
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, Dict, Any
 
 # Try to import the individual packages
@@ -30,10 +31,21 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = "https://gsvccxhdgcshiwgjvgfi.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdzdmNjeGhkZ2NzaGl3Z2p2Z2ZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjczOTY2NTIsImV4cCI6MjA4Mjk3MjY1Mn0.Sbb6YJjlQ_ig2LCcs9zz_Be1kU-iIHBx4Vu4nzCPyTM"
 
-# Stripe configuration - Pricing Plans
-STRIPE_PRICE_ID_STARTER = "price_1SeEv5BATYQXewwiQ5XO32PD"  # Starter plan
-STRIPE_PRICE_ID_ULTRA = "price_1SuJOxBATYQXewwiuqsqAcMJ"  # Ultra plan $49/month
-STRIPE_PRICE_ID = STRIPE_PRICE_ID_STARTER  # Default for checkout
+# Stripe configuration - Pricing Plans (Basic / Pro / Premium, monthly + annual)
+STRIPE_PRICE_ID_BASIC          = "price_1SeEv5BATYQXewwiQ5XO32PD"  # $15/mo
+STRIPE_PRICE_ID_BASIC_ANNUAL   = "price_1TbNhCBATYQXewwi6k6RJfAV"  # $120/yr
+STRIPE_PRICE_ID_PRO            = "price_1SuJOxBATYQXewwiuqsqAcMJ"  # $49/mo
+STRIPE_PRICE_ID_PRO_ANNUAL     = "price_1TbNhOBATYQXewwinVl6TOP1"  # $399/yr
+STRIPE_PRICE_ID_PREMIUM        = "price_1TbMZjBATYQXewwiLqkGfPuX"  # $199/mo
+STRIPE_PRICE_ID_PREMIUM_ANNUAL = "price_1TbNhOBATYQXewwiHTK56Jwy"  # $1,599/yr
+STRIPE_PRICE_ID = STRIPE_PRICE_ID_BASIC  # default for checkout
+
+# Map every price (monthly AND annual) to its tier.
+PRICE_TO_TIER = {
+    STRIPE_PRICE_ID_BASIC: 'basic',     STRIPE_PRICE_ID_BASIC_ANNUAL: 'basic',
+    STRIPE_PRICE_ID_PRO: 'pro',         STRIPE_PRICE_ID_PRO_ANNUAL: 'pro',
+    STRIPE_PRICE_ID_PREMIUM: 'premium', STRIPE_PRICE_ID_PREMIUM_ANNUAL: 'premium',
+}
 
 # Redirect URLs for authentication flows
 SITE_URL = "https://filect.io"
@@ -41,9 +53,16 @@ REDIRECT_URL_SIGNUP = f"{SITE_URL}/signup-success"
 REDIRECT_URL_PASSWORD_RESET = f"{SITE_URL}/secret-reset-password"
 REDIRECT_URL_PAYMENT_SUCCESS = f"{SITE_URL}/payment-success"
 
-# Index limits per plan (images, videos, audio only - text files are unlimited)
-INDEX_LIMIT_STARTER = 1000   # 1000 media files per month for starter
-INDEX_LIMIT_ULTRA = 5000     # 5000 media files per month for ultra
+# Media index limits per tier (images, videos, audio only - text files are unlimited)
+INDEX_LIMITS = {'basic': 1000, 'pro': 5000, 'premium': 50000}
+INDEX_LIMIT_BASIC   = INDEX_LIMITS['basic']
+INDEX_LIMIT_PRO     = INDEX_LIMITS['pro']
+INDEX_LIMIT_PREMIUM = INDEX_LIMITS['premium']
+# Back-compat aliases (older code/imports referenced these names)
+INDEX_LIMIT_STARTER = INDEX_LIMITS['basic']
+INDEX_LIMIT_ULTRA   = INDEX_LIMITS['pro']
+STRIPE_PRICE_ID_STARTER = STRIPE_PRICE_ID_BASIC
+STRIPE_PRICE_ID_ULTRA = STRIPE_PRICE_ID_PRO
 
 
 class SupabaseAuth:
@@ -302,39 +321,37 @@ class SupabaseAuth:
                 logger.warning("[SUB CHECK] Database client not available")
                 return {'has_subscription': False, 'status': None, 'error': 'Database not available'}
             
-            # Query subscriptions table
+            # Query subscriptions table - prioritize active/trialing subscriptions.
+            # Order by created_at DESC so the most recent row wins when there are several.
             logger.info(f"[SUB CHECK] Querying subscriptions table for user_id: {user_id}")
-            response = db_client.from_('subscriptions').select('*').eq('user_id', user_id).execute()
-            
+            response = db_client.from_('subscriptions').select('*').eq('user_id', user_id).order('created_at', desc=True).execute()
+
             logger.info(f"[SUB CHECK] Query response: {response.data}")
-            
+
             if response.data and len(response.data) > 0:
-                sub = response.data[0]
+                # Prefer an active/trialing subscription; fall back to the most recent row.
+                sub = None
+                for s in response.data:
+                    if s.get('status') in ('active', 'trialing'):
+                        sub = s
+                        break
+                if not sub:
+                    sub = response.data[0]
+
                 self._subscription = sub
                 logger.info(f"[SUB CHECK] Found subscription: {sub}")
-                
+
                 status = sub.get('status')
-                is_active = status in ('active', 'trialing')
-                logger.info(f"[SUB CHECK] Status: {status}, is_active (before date check): {is_active}")
-                
-                # Check if subscription has expired
                 period_end = sub.get('current_period_end')
-                logger.info(f"[SUB CHECK] current_period_end: {period_end}")
-                
-                if period_end and is_active:
-                    try:
-                        end_date = datetime.fromisoformat(period_end.replace('Z', '+00:00'))
-                        now = datetime.now(end_date.tzinfo)
-                        logger.info(f"[SUB CHECK] end_date: {end_date}, now: {now}")
-                        if end_date < now:
-                            logger.info("[SUB CHECK] Subscription has EXPIRED")
-                            is_active = False
-                        else:
-                            logger.info("[SUB CHECK] Subscription is VALID")
-                    except Exception as e:
-                        logger.warning(f"[SUB CHECK] Date parsing error: {e}")
-                
-                logger.info(f"[SUB CHECK] Final result: has_subscription={is_active}")
+                # Trust the Stripe status as the source of truth. We deliberately do
+                # NOT expire the user based on current_period_end: the webhook does
+                # not refresh that field each billing cycle, so it holds the original
+                # trial-end / first-period date and would wrongly flag long-time
+                # active subscribers as expired. Stripe moves truly-ended subs off
+                # 'active'/'trialing', so status is the reliable signal.
+                is_active = status in ('active', 'trialing')
+                logger.info(f"[SUB CHECK] Status: {status}, current_period_end: {period_end}, has_subscription={is_active}")
+
                 return {
                     'has_subscription': is_active,
                     'status': status,
@@ -382,47 +399,81 @@ class SupabaseAuth:
     def get_plan_tier(self) -> str:
         """
         Get current user's plan tier based on their subscription price_id.
-        
+
         Returns:
-            'ultra' for Ultra plan, 'starter' for Starter plan, 'free' for no subscription
+            'basic' / 'pro' / 'premium', or 'free' for no active subscription.
         """
         if not self._subscription:
             # Try to refresh subscription info
             self.check_subscription()
-        
+
         if not self._subscription:
             return 'free'
-        
+
         price_id = self._subscription.get('price_id', '')
         status = self._subscription.get('status', '')
-        
+
         if status not in ('active', 'trialing'):
             return 'free'
-        
-        if price_id == STRIPE_PRICE_ID_ULTRA:
-            return 'ultra'
-        else:
-            return 'starter'
-    
+
+        # Unknown-but-active price falls back to 'basic' so the user isn't locked out.
+        return PRICE_TO_TIER.get(price_id, 'basic')
+
     def get_index_limit(self) -> int:
-        """Get the index limit for current user's plan (images, videos, audio only)."""
-        tier = self.get_plan_tier()
-        if tier == 'ultra':
-            return INDEX_LIMIT_ULTRA
-        elif tier == 'starter':
-            return INDEX_LIMIT_STARTER
-        else:
-            return 0  # No subscription = no indexing
-    
+        """Get the media index limit for current user's plan."""
+        return INDEX_LIMITS.get(self.get_plan_tier(), 0)
+
     def get_current_period_start(self) -> Optional[str]:
-        """Get current billing period start date."""
+        """
+        Start date (YYYY-MM-DD) of the user's current MONTHLY usage window.
+
+        Usage resets monthly on the user's billing anniversary — i.e. the day of
+        the month their paid billing recurs on (the day the trial ends / first
+        charge). We derive that "anchor day" from the day-of-month of
+        `current_period_end` (which equals the trial-end date during the trial and
+        the renewal date afterwards; its day-of-month is stable across renewals,
+        so this is correct even though our webhook doesn't refresh the period each
+        cycle). Annual plans reset monthly on the same anchor day too.
+
+        Returns None if there is no subscription.
+        """
         if not self._subscription:
             self.check_subscription()
-        
-        if self._subscription:
-            return self._subscription.get('current_period_start')
-        return None
-    
+
+        if not self._subscription:
+            return None
+
+        # Determine the anchor day-of-month. Prefer current_period_end (the billing
+        # anniversary); fall back to created_at; default to 1.
+        anchor_src = (self._subscription.get('current_period_end')
+                      or self._subscription.get('created_at'))
+        anchor_day = 1
+        if anchor_src:
+            try:
+                anchor_day = int(str(anchor_src)[8:10])
+            except (ValueError, TypeError):
+                anchor_day = 1
+        if not (1 <= anchor_day <= 31):
+            anchor_day = 1
+
+        def anchored_date(year: int, month: int) -> date:
+            """The anchor day within a given month, clamped to that month's length."""
+            last_day = calendar.monthrange(year, month)[1]
+            return date(year, month, min(anchor_day, last_day))
+
+        today = datetime.now().date()
+        # This month's anchor date.
+        this_month = anchored_date(today.year, today.month)
+        if today >= this_month:
+            window_start = this_month
+        else:
+            # Before the anchor day this month -> window started on last month's anchor.
+            prev_year = today.year if today.month > 1 else today.year - 1
+            prev_month = today.month - 1 if today.month > 1 else 12
+            window_start = anchored_date(prev_year, prev_month)
+
+        return window_start.isoformat()
+
     def get_index_usage(self) -> Dict[str, Any]:
         """
         Get current index usage for the billing period.
@@ -446,31 +497,25 @@ class SupabaseAuth:
             if not db_client:
                 return {'count': 0, 'limit': limit, 'remaining': limit, 'error': 'Database not available'}
             
-            # Query index_usage table for current period - just filter by user_id
-            # (period_start comparison can fail due to timestamp format differences)
+            # Query index_usage rows for this user, then match the row for the
+            # current monthly window by date portion. IMPORTANT: if there is no
+            # row for the current window, count is 0 — a new window means the
+            # usage has reset (do NOT fall back to a previous window's count).
             response = db_client.from_('index_usage').select('*').eq(
                 'user_id', user_id
             ).execute()
-            
+
             logger.debug(f"[USAGE] Query response for user {user_id}: {response.data}")
-            
-            if response.data and len(response.data) > 0:
-                # Find the record that matches our period (compare date portion only)
-                target_date = period_start[:10] if period_start else None  # Extract YYYY-MM-DD
-                count = 0
-                for record in response.data:
-                    record_period = record.get('period_start', '')
-                    # Compare date portion to handle format differences
-                    if record_period and target_date and record_period[:10] == target_date:
-                        count = record.get('indexed_count', 0)
-                        logger.debug(f"[USAGE] Found matching record: count={count}")
-                        break
-                    # Fallback: use most recent record if no exact match
-                    if not count:
-                        count = record.get('indexed_count', 0)
-            else:
-                count = 0
-            
+
+            target_date = period_start[:10]  # YYYY-MM-DD of the current window
+            count = 0
+            for record in (response.data or []):
+                record_period = record.get('period_start', '')
+                if record_period and record_period[:10] == target_date:
+                    count = record.get('indexed_count', 0)
+                    logger.debug(f"[USAGE] Found matching record for window {target_date}: count={count}")
+                    break
+
             logger.debug(f"[USAGE] Returning count={count}, limit={limit}")
             return {
                 'count': count,
@@ -624,9 +669,81 @@ class SupabaseAuth:
             logger.error(f"Email verification error: {error_msg}")
             return {'success': False, 'error': error_msg}
 
+    def verify_signup_code(self, email: str, code: str) -> Dict[str, Any]:
+        """
+        Verify a signup using the 6-digit code emailed to the user.
+
+        The confirmation email contains both a 6-digit code and a "Verify account"
+        button (filect://verify deep link). This is the in-app code path; the deep
+        link path is handled in main.py via verify_email_token(). Either one verifies
+        the same Supabase OTP, so whichever the user does first succeeds.
+        """
+        if not self._auth_client:
+            return {'success': False, 'error': 'Supabase not available'}
+
+        try:
+            response = self._auth_client.verify_otp({
+                'email': email,
+                'token': code.strip(),
+                'type': 'signup'
+            })
+
+            if response.user and response.session:
+                self._user = self._extract_user_dict(response.user)
+                self._session = self._extract_session_dict(response.session)
+                self._access_token = self._session.get('access_token')
+                logger.info(f"Email verified by code for: {self._user.get('email')}")
+                return {'success': True, 'user': self._user}
+            else:
+                return {'success': False, 'error': 'Verification failed'}
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Code verification error: {error_msg}")
+            return {'success': False, 'error': error_msg}
+
+    def resend_signup_code(self, email: str) -> Dict[str, Any]:
+        """Resend the 6-digit signup confirmation code."""
+        if not self._auth_client:
+            return {'success': False, 'error': 'Supabase not available'}
+        try:
+            self._auth_client.resend({'type': 'signup', 'email': email})
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def open_web_pricing(self) -> bool:
+        """
+        Open the website pricing page in the browser, pre-identified with this
+        account (uid + email) so the user can pick a plan and check out without
+        logging in again on the web. Payment + plan selection live on the web.
+        """
+        if not self._user:
+            logger.warning("Cannot open pricing: user not authenticated")
+            return False
+        from urllib.parse import quote
+        email = self._user.get('email', '')
+        user_id = self._user.get('id', '')
+        url = f"https://filect.io/pricing.html?uid={user_id}&email={quote(email)}&source=app"
+        # If they already have an active plan, this is an UPGRADE: pass the current
+        # price so the pricing page shows "Switch to this plan" (no free-trial CTA)
+        # instead of treating them like a new subscriber.
+        if not self._subscription:
+            self.check_subscription()
+        sub = self._subscription or {}
+        if sub.get('price_id') and sub.get('status') in ('active', 'trialing'):
+            url += f"&current={sub['price_id']}"
+        try:
+            webbrowser.open(url)
+            logger.info(f"Opened web pricing for user: {email}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to open pricing page: {e}")
+            return False
+
     def open_upgrade_checkout(self) -> bool:
-        """Open checkout for upgrading to Ultra plan."""
-        return self.open_checkout(price_id=STRIPE_PRICE_ID_ULTRA)
+        """Upgrades now happen on the web pricing page (choose Pro/Premium there)."""
+        return self.open_web_pricing()
 
 
 def get_latest_app_version() -> Optional[Dict[str, Any]]:

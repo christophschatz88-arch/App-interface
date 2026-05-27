@@ -569,7 +569,8 @@ class AuthDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         self.setModal(True)
         self.setObjectName("authDialog")
-        
+        self._pending_email = ""
+
         self._setup_ui()
         self._setup_connections()
         
@@ -634,7 +635,8 @@ class AuthDialog(QDialog):
         self._create_login_page()
         self._create_signup_page()
         self._create_subscribe_page()
-        
+        self._create_verify_page()
+
         layout.addWidget(self.container)
         
         # Start with login page
@@ -830,19 +832,19 @@ class AuthDialog(QDialog):
         card_layout.setSpacing(16)
         
         # Plan badge
-        plan_badge = QLabel("PRO PLAN")
+        plan_badge = QLabel("CHOOSE YOUR PLAN")
         plan_badge.setObjectName("planBadge")
         plan_badge.setAlignment(Qt.AlignCenter)
         card_layout.addWidget(plan_badge)
-        
+
         # Price
         price_layout = QHBoxLayout()
         price_layout.setAlignment(Qt.AlignCenter)
         price_layout.setSpacing(4)
-        
-        price_amount = QLabel("$15")
+
+        price_amount = QLabel("from $15")
         price_amount.setObjectName("priceAmount")
-        price_period = QLabel("/ month")
+        price_period = QLabel("/ mo")
         price_period.setObjectName("pricePeriod")
         
         price_layout.addWidget(price_amount)
@@ -873,7 +875,7 @@ class AuthDialog(QDialog):
         layout.addSpacing(16)
         
         # Subscribe button
-        self.subscribe_button = QPushButton("Subscribe Now")
+        self.subscribe_button = QPushButton("View plans && subscribe")
         self.subscribe_button.setObjectName("primaryButton")
         self.subscribe_button.setMinimumHeight(52)
         self.subscribe_button.setCursor(Qt.PointingHandCursor)
@@ -894,9 +896,76 @@ class AuthDialog(QDialog):
         self.logout_button.setObjectName("linkButton")
         self.logout_button.setCursor(Qt.PointingHandCursor)
         layout.addWidget(self.logout_button, alignment=Qt.AlignCenter)
-        
+
         self.stack.addWidget(page)
-    
+
+    def _create_verify_page(self):
+        """Email code-verification page, shown after signup.
+
+        The confirmation email contains BOTH a 6-digit code (entered here) and a
+        "Verify account" button (filect:// deep link, handled in main.py). If the
+        user clicks the email button instead, the deep-link handler verifies and
+        calls _check_subscription_silent(), which advances off this page on its
+        own — so the code is never required in that case.
+        """
+        page = QWidget()
+        page.setObjectName("authPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        header = QLabel("Check your email")
+        header.setObjectName("authWelcome")
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+
+        self.verify_message = QLabel(
+            "We sent a 6-digit code to your email. Enter it below to verify your "
+            "account — or just click the “Verify account” button in that email."
+        )
+        self.verify_message.setObjectName("authSwitchLabel")
+        self.verify_message.setAlignment(Qt.AlignCenter)
+        self.verify_message.setWordWrap(True)
+        layout.addWidget(self.verify_message)
+
+        layout.addSpacing(8)
+
+        code_container, self.verify_code = self._create_input_field(
+            "Verification code", "Enter 6-digit code"
+        )
+        layout.addWidget(code_container)
+
+        self.verify_button = QPushButton("Verify && Continue")
+        self.verify_button.setObjectName("primaryButton")
+        self.verify_button.setMinimumHeight(52)
+        self.verify_button.setCursor(Qt.PointingHandCursor)
+        layout.addWidget(self.verify_button)
+
+        self.verify_error = QLabel("")
+        self.verify_error.setObjectName("errorLabel")
+        self.verify_error.setAlignment(Qt.AlignCenter)
+        self.verify_error.setWordWrap(True)
+        self.verify_error.setMinimumHeight(24)
+        layout.addWidget(self.verify_error)
+
+        layout.addStretch()
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(4)
+        self.resend_code_button = QPushButton("Resend code")
+        self.resend_code_button.setObjectName("linkButton")
+        self.resend_code_button.setCursor(Qt.PointingHandCursor)
+        self.verify_back_button = QPushButton("Back to sign in")
+        self.verify_back_button.setObjectName("linkButton")
+        self.verify_back_button.setCursor(Qt.PointingHandCursor)
+        bottom.addStretch()
+        bottom.addWidget(self.resend_code_button)
+        bottom.addWidget(self.verify_back_button)
+        bottom.addStretch()
+        layout.addLayout(bottom)
+
+        self.stack.addWidget(page)
+
     def _setup_connections(self):
         """Set up signal connections."""
         # Login page
@@ -904,15 +973,21 @@ class AuthDialog(QDialog):
         self.login_password.returnPressed.connect(self._do_login)
         self.to_signup_button.clicked.connect(self._go_to_signup)
         self.forgot_password_btn.clicked.connect(self._show_forgot_password)
-        
+
         # Signup page
         self.signup_button.clicked.connect(self._do_signup)
         self.signup_confirm.returnPressed.connect(self._do_signup)
         self.to_login_button.clicked.connect(self._go_to_login)
-        
+
         # Subscribe page
         self.subscribe_button.clicked.connect(self._open_checkout)
         self.logout_button.clicked.connect(self._do_logout)
+
+        # Verify page
+        self.verify_button.clicked.connect(self._do_verify_code)
+        self.verify_code.returnPressed.connect(self._do_verify_code)
+        self.resend_code_button.clicked.connect(self._resend_code)
+        self.verify_back_button.clicked.connect(self._go_to_login)
     
     def _show_forgot_password(self):
         """Show the forgot password dialog."""
@@ -933,7 +1008,59 @@ class AuthDialog(QDialog):
         self.subtitle_label.setText("Sign in to your account")
         self.stack.setCurrentIndex(0)
         self.setFixedSize(460, 680)
-    
+
+    def _go_to_verify(self, email):
+        """Show the code-verification page after signup."""
+        self._pending_email = email
+        self.title_label.setText("Verify your email")
+        self.subtitle_label.setText("One quick step to finish")
+        self.verify_message.setText(
+            f"We sent a 6-digit code to {email}. Enter it below — or click the "
+            f"“Verify account” button in that email and we’ll finish it for you."
+        )
+        self.verify_code.clear()
+        self.verify_error.setText("")
+        self.stack.setCurrentIndex(3)
+        self.setFixedSize(460, 680)
+        self.verify_code.setFocus()
+
+    def _do_verify_code(self):
+        """Verify the 6-digit signup code, then continue."""
+        code = self.verify_code.text().strip()
+        if not code:
+            self.verify_error.setText("Enter the code from your email")
+            return
+
+        self.verify_button.setEnabled(False)
+        self.verify_button.setText("Verifying...")
+
+        result = supabase_auth.verify_signup_code(self._pending_email, code)
+
+        self.verify_button.setEnabled(True)
+        self.verify_button.setText("Verify && Continue")
+
+        if result.get('success'):
+            self.verify_error.setText("")
+            tokens = supabase_auth.get_session_tokens()
+            if tokens:
+                settings.set_auth_tokens(
+                    tokens['access_token'],
+                    tokens['refresh_token'],
+                    self._pending_email
+                )
+            self._check_subscription_silent()
+        else:
+            self.verify_error.setText("That code is incorrect or expired. Check your email and try again.")
+
+    def _resend_code(self):
+        """Resend the signup confirmation code."""
+        result = supabase_auth.resend_signup_code(self._pending_email)
+        if result.get('success'):
+            self.verify_error.setText("")
+            self.verify_message.setText(f"New code sent to {self._pending_email}. Enter it below.")
+        else:
+            self.verify_error.setText("Could not resend the code. Please try again.")
+
     def _try_restore_session(self):
         """Try to restore a previous session."""
         if settings.has_stored_session():
@@ -1009,9 +1136,7 @@ class AuthDialog(QDialog):
             self.signup_error.setText("")
             
             if result.get('needs_confirmation'):
-                EmailConfirmationDialog.show_confirmation(self, email)
-                self._go_to_login()
-                self.login_email.setText(email)
+                self._go_to_verify(email)
             else:
                 # Account created and auto-logged in
                 tokens = supabase_auth.get_session_tokens()
@@ -1032,26 +1157,29 @@ class AuthDialog(QDialog):
         email = supabase_auth.user_email or settings.auth_user_email
         short_email = email.split('@')[0] if email else "there"
         self.welcome_label.setText(f"Hey {short_email}! 👋")
-        self.title_label.setText("Unlock Pro Features")
-        self.subtitle_label.setText("Subscribe to access all features")
+        self.title_label.setText("Unlock Filect")
+        self.subtitle_label.setText("Choose a plan to access all features")
         self.stack.setCurrentIndex(2)
-        self.setFixedSize(460, 680)
+        # Taller than the other pages so the plan card isn't clipped on
+        # high-DPI / scaled displays.
+        self.setFixedSize(460, 730)
     
     def _open_checkout(self):
-        """Open Stripe checkout in browser and start polling."""
+        """Open the web pricing page (plan selection + payment) and start polling."""
         self.sub_status.setObjectName("statusLabel")
         self.sub_status.setStyleSheet("")
 
-        success = supabase_auth.open_checkout()
+        success = supabase_auth.open_web_pricing()
 
         if success:
-            self.subscribe_button.setText("Open Checkout Again")
-            self.sub_status.setText("Complete payment in your browser — click above if the window closed.")
+            self.subscribe_button.setText("View plans again")
+            self.sub_status.setText("Choose a plan in your browser — the app unlocks once you subscribe.")
+            # Restart polling from zero each time the pricing page is opened
             self._poll_count = 0
             self._poll_timer.start(3000)
         else:
-            self.subscribe_button.setText("Subscribe Now")
-            self.sub_status.setText("Failed to open checkout. Try again.")
+            self.subscribe_button.setText("View plans && subscribe")
+            self.sub_status.setText("Couldn't open the plans page. Try again.")
             self.sub_status.setObjectName("errorLabel")
 
     def _poll_subscription(self):
@@ -1061,7 +1189,7 @@ class AuthDialog(QDialog):
         # Silent timeout after 30 minutes — reset button, stop polling
         if self._poll_count > 600:
             self._poll_timer.stop()
-            self.subscribe_button.setText("Subscribe Now")
+            self.subscribe_button.setText("View plans && subscribe")
             self.sub_status.setText("")
             return
 
