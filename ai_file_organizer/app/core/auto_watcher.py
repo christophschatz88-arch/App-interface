@@ -31,6 +31,7 @@ class AutoWatcherWorker(QThread):
     status_changed = Signal(str)  # status message
     error_occurred = Signal(str, str)  # file_path, error_message
     finished_processing = Signal(list)  # Emitted when done, with list of all processed file paths
+    limit_reached = Signal(dict)  # emitted once when the monthly index limit is hit
     
     def __init__(self, file_paths: List[str], folder: str, instruction: str, 
                  folder_instructions: Dict[str, str] = None,
@@ -154,6 +155,8 @@ class AutoWatcherWorker(QThread):
                         logger.warning(f"[Worker] Index limit reached: {result.get('error')}")
                         self.status_changed.emit("Index limit reached - upgrade for more")
                         self.error_occurred.emit(file_path, result.get('error', 'Index limit reached'))
+                        # Surface to the UI so the upgrade popup can be shown (once per run).
+                        self.limit_reached.emit({})
                     elif result.get('error'):
                         logger.warning(f"[Worker] Failed to index {file_path}: {result.get('error')}")
                     
@@ -384,7 +387,8 @@ class AutoOrganizeWatcher(QObject):
     file_indexed = Signal(str)  # file_path that was auto-indexed
     error_occurred = Signal(str, str)  # file_path, error_message
     status_changed = Signal(str)  # status message
-    
+    limit_reached = Signal(dict)  # monthly index limit hit during auto-organize
+
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -1049,6 +1053,7 @@ class AutoOrganizeWatcher(QObject):
         self._current_worker.file_organized.connect(self._on_worker_file_organized)
         self._current_worker.status_changed.connect(self._on_worker_status)
         self._current_worker.error_occurred.connect(self._on_worker_error)
+        self._current_worker.limit_reached.connect(self._on_worker_limit_reached)
         self._current_worker.finished_processing.connect(self._on_worker_finished_with_files)
         
         self._current_worker.start()
@@ -1072,7 +1077,11 @@ class AutoOrganizeWatcher(QObject):
     def _on_worker_error(self, file_path: str, error: str):
         """Handle error from worker."""
         self.error_occurred.emit(file_path, error)
-    
+
+    def _on_worker_limit_reached(self, info: dict):
+        """Forward the index-limit signal so the UI can show the upgrade popup."""
+        self.limit_reached.emit(info or {})
+
     def _on_worker_finished_with_files(self, processed_files: list):
         """Handle worker finished with list of processed files."""
         # Add all processed files to _organized_files to prevent re-processing

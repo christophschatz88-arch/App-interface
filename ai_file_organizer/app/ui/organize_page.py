@@ -4789,6 +4789,7 @@ class OrganizePage(QWidget):
         self.auto_watcher.file_indexed.connect(self._on_watch_file_indexed)
         self.auto_watcher.status_changed.connect(self._on_watch_status)
         self.auto_watcher.error_occurred.connect(self._on_watch_error)
+        self.auto_watcher.limit_reached.connect(self._on_watch_limit_reached)
     
     def setup_ui(self):
         """Setup the organization page UI."""
@@ -6171,6 +6172,20 @@ class OrganizePage(QWidget):
     def _on_watch_error(self, path: str, error: str):
         """Handle errors from watcher."""
         logger.error(f"Watch error for {path}: {error}")
+
+    def _on_watch_limit_reached(self, info: dict):
+        """Show the upgrade popup when auto-organize hits the monthly index limit.
+
+        Debounced to once per session so repeated background batches don't spam
+        the dialog. Reuses MainWindow._show_upgrade_dialog (the same popup the
+        manual 'Index Files' path uses) for a single source of truth.
+        """
+        if getattr(self, '_auto_limit_popup_shown', False):
+            return
+        self._auto_limit_popup_shown = True
+        main_window = self.window()
+        if main_window is not None and hasattr(main_window, '_show_upgrade_dialog'):
+            main_window._show_upgrade_dialog(info or {})
     
     def showEvent(self, event):
         """Refresh file count when page becomes visible."""
