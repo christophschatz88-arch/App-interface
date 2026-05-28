@@ -401,21 +401,23 @@ def deduplicate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
 def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_info: List[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Ensure all provided file IDs are included in the plan.
-    
-    If the AI missed any files, automatically add them to a 'misc' folder.
-    This prevents files from being left unorganized in auto-organize mode.
-    
+
+    If the AI missed any files, place them in the most relevant existing folder
+    based on each file's metadata. This prevents files from being left
+    unorganized and avoids inventing a generic 'misc' folder when real folders
+    already exist in the plan.
+
     Args:
         plan: The organization plan from AI
         all_file_ids: Set of all file IDs that should be in the plan
         files_info: Optional list of file info dicts for better folder selection
-        
+
     Returns:
         Updated plan with all files included
     """
     if not plan or "folders" not in plan:
         plan = {"folders": {}}
-    
+
     # Collect all file IDs currently in the plan
     included_ids = set()
     for folder_name, file_ids in plan.get("folders", {}).items():
@@ -424,15 +426,15 @@ def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_inf
                 included_ids.add(int(fid))
             except (TypeError, ValueError):
                 pass
-    
+
     # Find missing file IDs
     missing_ids = all_file_ids - included_ids
-    
+
     if not missing_ids:
         return plan  # All files are included
-    
-    logger.warning(f"AI plan missing {len(missing_ids)} file(s). Adding them to 'misc' folder.")
-    
+
+    logger.warning(f"AI plan missing {len(missing_ids)} file(s). Adding them to existing folders.")
+
     # Log which files are missing for debugging
     if files_info:
         missing_names = []
@@ -444,28 +446,81 @@ def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_inf
                 pass
         if missing_names:
             logger.info(f"Missing files: {', '.join(missing_names[:10])}")
-    
-    # Add missing files to 'misc' folder
+
     folders = plan.get("folders", {})
-    
-    # Use 'misc' if it exists, otherwise create it
-    misc_folder = None
-    for name in ['misc', 'other', 'unsorted']:
-        if name in folders:
-            misc_folder = name
-            break
-    
-    if misc_folder is None:
-        misc_folder = 'misc'
-        folders[misc_folder] = []
-    
-    # Add missing IDs to misc folder
-    for missing_id in missing_ids:
-        folders[misc_folder].append(missing_id)
-    
-    logger.info(f"Added {len(missing_ids)} missing file(s) to '{misc_folder}' folder")
-    
+
+    # If real folders already exist in the plan, route each missing file to the
+    # MOST RELEVANT one based on its own metadata (name/ext/label/category/tags)
+    # rather than inventing a generic 'misc' folder or dumping into the first
+    # folder. A 'misc' folder is created only as a last resort when the plan
+    # has no folders at all.
+    if folders:
+        info_by_id = {}
+        if files_info:
+            for f in files_info:
+                try:
+                    info_by_id[int(f.get('id', 0))] = f
+                except (TypeError, ValueError):
+                    pass
+        folder_names = list(folders.keys())
+        for missing_id in missing_ids:
+            target = _best_folder_for_file(info_by_id.get(missing_id), folder_names)
+            folders[target].append(missing_id)
+            logger.info(f"Added missing file id {missing_id} to most relevant folder '{target}'")
+    else:
+        # No folders at all — create a misc folder as the last resort.
+        folders['misc'] = list(missing_ids)
+        logger.info(f"Added {len(missing_ids)} missing file(s) to 'misc' folder (no existing folders)")
+
     return {"folders": folders}
+
+
+def _best_folder_for_file(file_info: Optional[Dict[str, Any]], folder_names: List[str]) -> str:
+    """Pick the existing folder whose name best matches a file's metadata.
+
+    Scores each folder name against the file's name, extension, label,
+    category, and tags using substring matches plus difflib.SequenceMatcher
+    similarity. Falls back to the first folder when no signal is available,
+    and to 'misc' when there are no folders at all.
+    """
+    if not folder_names:
+        return 'misc'
+    if not file_info:
+        return folder_names[0]
+
+    import difflib
+
+    # Build descriptive terms for the file from its metadata
+    terms = []
+    name = file_info.get('file_name', '') or ''
+    if name:
+        stem = name.rsplit('.', 1)[0]
+        ext = name.rsplit('.', 1)[1].lower() if '.' in name else ''
+        terms.extend(part for part in stem.replace('_', ' ').replace('-', ' ').split() if part)
+        if ext:
+            terms.append(ext)
+    if file_info.get('label'):
+        terms.append(str(file_info['label']))
+    if file_info.get('category'):
+        terms.append(str(file_info['category']))
+    for tag in (file_info.get('tags') or []):
+        terms.append(str(tag))
+    terms = [t.lower() for t in terms if t]
+
+    best_folder = folder_names[0]
+    best_score = 0.0
+    for folder in folder_names:
+        folder_lc = folder.lower()
+        score = 0.0
+        for term in terms:
+            if term in folder_lc or folder_lc in term:
+                score = max(score, 1.0)
+            else:
+                score = max(score, difflib.SequenceMatcher(None, term, folder_lc).ratio())
+        if score > best_score:
+            best_score = score
+            best_folder = folder
+    return best_folder
 
 
 # ─────────────────────────────────────────────────────────────

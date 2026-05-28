@@ -497,7 +497,7 @@ class AutoOrganizeWatcher(QObject):
         if flatten_first:
             total_flattened = 0
             for folder in self.watched_folders:
-                count = self.flatten_folder(folder)
+                count = self.flatten_folder(folder, instruction=self.folder_instructions.get(folder, ''))
                 total_flattened += count
             if total_flattened > 0:
                 self.status_changed.emit(f"Flattened {total_flattened} files from subfolders")
@@ -537,16 +537,20 @@ class AutoOrganizeWatcher(QObject):
         self.status_changed.emit("Watcher stopped")
         logger.info("Watcher stopped")
     
-    def flatten_folder(self, folder_path: str) -> int:
+    def flatten_folder(self, folder_path: str, instruction: str = None) -> int:
         """
         Flatten folder by moving all files from subfolders to root.
-        
+
         This is used for the "Re-organize All" feature to reset folder structure
         before applying new organization instructions.
-        
+
         Args:
             folder_path: Path to the folder to flatten
-            
+            instruction: Optional user instruction. When provided, folders the
+                user explicitly named ("called X" / "named X") are auto-created
+                up front and protected from the empty-folder cleanup that runs
+                at the end of flattening.
+
         Returns:
             Number of files moved
         """
@@ -554,7 +558,16 @@ class AutoOrganizeWatcher(QObject):
         if not os.path.isdir(folder_path):
             logger.warning(f"Cannot flatten - not a directory: {folder_path}")
             return 0
-        
+
+        # Auto-create user-named folders up front so they exist as destinations
+        # for the AI step and survive the empty-folder cleanup below.
+        protected: set = set()
+        if instruction:
+            named = self._extract_named_folders(instruction)
+            if named:
+                self._ensure_named_folders_exist(folder_path, instruction)
+                protected = {n.lower() for n in named}
+
         moved_count = 0
         files_to_move = []
         
@@ -596,27 +609,94 @@ class AutoOrganizeWatcher(QObject):
                 logger.error(f"Error flattening {file_path}: {e}")
                 self.error_occurred.emit(file_path, str(e))
         
-        # Clean up empty subdirectories
-        self._cleanup_empty_folders(folder_path)
-        
+        # Clean up empty subdirectories, preserving any folders the user
+        # explicitly named in their instruction.
+        self._cleanup_empty_folders(folder_path, protected_names=protected)
+
         logger.info(f"Flattened {moved_count} files in {folder_path}")
         return moved_count
     
-    def _cleanup_empty_folders(self, root_folder: str) -> int:
-        """Remove empty subdirectories. Returns count of removed folders."""
+    def _extract_named_folders(self, instruction: str) -> List[str]:
+        """Extract folder names the user explicitly named in their instruction.
+
+        Relies on the reliable "called X" / "named X" phrasing. The capture
+        stops at conjunctions/prepositions (and, except, where, to, ...) so
+        names like "everything else" are kept whole without bleeding into the
+        rest of the sentence.
+        """
+        if not instruction:
+            return []
+        import re
+        names = []
+        seen = set()
+        stopwords = {'a', 'an', 'the', 'it', 'them', 'this', 'that'}
+
+        pattern = (
+            r'(?:called|named)\s+["\']?([A-Za-z0-9][\w \-]*?)["\']?'
+            r'(?=\s+(?:and|except|where|to|in|on|into|onto|or|but|then)\b|["\',.\n]|$)'
+        )
+        for m in re.finditer(pattern, instruction, flags=re.IGNORECASE):
+            name = m.group(1).strip().strip('"\'').strip()
+            key = name.lower()
+            if not name or key in seen or key in stopwords or len(name) > 60:
+                continue
+            if 'folder' in key or ' move ' in key:
+                continue
+            seen.add(key)
+            names.append(name)
+        return names
+
+    def _ensure_named_folders_exist(self, folder_path: str, instruction: str) -> None:
+        """Create folders the user named in their instruction if they don't exist.
+
+        Uses a case-insensitive check against current subfolders so existing
+        folders are never duplicated.
+        """
+        named = self._extract_named_folders(instruction)
+        if not named:
+            return
+        try:
+            existing_lower = {
+                item.lower() for item in os.listdir(folder_path)
+                if os.path.isdir(os.path.join(folder_path, item))
+            }
+        except OSError:
+            existing_lower = set()
+        for name in named:
+            if name.lower() in existing_lower:
+                continue
+            try:
+                os.makedirs(os.path.join(folder_path, name), exist_ok=True)
+                logger.info(f"Created user-specified folder: {name}")
+                existing_lower.add(name.lower())
+            except OSError as e:
+                logger.warning(f"Could not create folder '{name}': {e}")
+
+    def _cleanup_empty_folders(self, root_folder: str, protected_names: set = None) -> int:
+        """Remove empty subdirectories. Returns count of removed folders.
+
+        Folders whose name is in ``protected_names`` (case-insensitive) are
+        never deleted, even when empty — typically the folders the user
+        explicitly named in their instruction.
+        """
         removed_count = 0
         root_folder = os.path.normpath(root_folder)
-        
+        protected = {n.lower() for n in (protected_names or set())}
+
         # Walk bottom-up to remove nested empty folders
         for dirpath, dirnames, filenames in os.walk(root_folder, topdown=False):
             # Skip the root folder itself (normalize for comparison)
             if os.path.normpath(dirpath) == root_folder:
                 continue
-            
+
             # Skip hidden folders
             if os.path.basename(dirpath).startswith('.'):
                 continue
-            
+
+            # Skip folders the user explicitly named in their instruction
+            if os.path.basename(dirpath).lower() in protected:
+                continue
+
             try:
                 # Check if folder is empty (no files or subdirs)
                 if not os.listdir(dirpath):
@@ -625,7 +705,7 @@ class AutoOrganizeWatcher(QObject):
                     logger.info(f"Removed empty folder: {dirpath}")
             except OSError as e:
                 logger.debug(f"Could not remove folder {dirpath}: {e}")
-        
+
         return removed_count
     
     def _should_ignore(self, file_path: str) -> bool:
@@ -744,7 +824,7 @@ class AutoOrganizeWatcher(QObject):
         if flatten_first:
             total_flattened = 0
             for folder in self.watched_folders:
-                count = self.flatten_folder(folder)
+                count = self.flatten_folder(folder, instruction=self.folder_instructions.get(folder, ''))
                 total_flattened += count
             if total_flattened > 0:
                 self.status_changed.emit(f"Flattened {total_flattened} files, now organizing...")
@@ -788,7 +868,7 @@ class AutoOrganizeWatcher(QObject):
         if folders_to_reorganize:
             total_flattened = 0
             for folder in folders_to_reorganize:
-                count = self.flatten_folder(folder)
+                count = self.flatten_folder(folder, instruction=self.folder_instructions.get(folder, ''))
                 total_flattened += count
             if total_flattened > 0:
                 self.status_changed.emit(f"Flattened {total_flattened} files from {len(folders_to_reorganize)} folder(s)...")
@@ -872,7 +952,7 @@ class AutoOrganizeWatcher(QObject):
         
         # Step 1: Flatten if requested
         if flatten_first:
-            count = self.flatten_folder(folder_path)
+            count = self.flatten_folder(folder_path, instruction=self.folder_instructions.get(folder_path, ''))
             if count > 0:
                 self.status_changed.emit(f"Flattened {count} files, now organizing...")
         
@@ -1004,12 +1084,18 @@ class AutoOrganizeWatcher(QObject):
                 f"[AUTO-ORGANIZE] User's specific instructions: {instruction}\n\n"
                 f"PARENT FOLDER NAME: '{parent_folder_name}' - DO NOT create a folder with this name!\n\n"
                 "RULES FOR AUTO-ORGANIZE MODE:\n"
-                "1. FOLLOW the user's specific instructions EXACTLY for any files they mentioned\n"
-                "2. For ALL REMAINING files not covered by user's instructions, organize them logically by file type\n"
-                "3. EVERY file MUST be placed in a folder - NO files left out\n"
-                "4. Use simple, clear folder names (e.g., 'photos', 'docs', 'videos', 'audio', 'misc')\n"
-                f"5. IMPORTANT: Do NOT create a folder named '{parent_folder_name}' - use different names\n"
-                "6. If user says 'screenshots to X' - put screenshots in X, organize everything else by type"
+                "1. STRICT: Files of any TYPE the user explicitly mentioned MUST go to the folder the user named for that type. "
+                "No exceptions, no alternative folders. If the user said 'videos to Clips', EVERY video file goes to 'Clips' — "
+                "do NOT route any video to a different folder (no 'media', no 'videos', no 'Clips_2').\n"
+                "2. ONLY for files of types the user did NOT mention may you create a new, meaningful folder by content type "
+                "(e.g. 'documents' for text/PDFs, 'audio' for music, 'code' for source files). This permission applies STRICTLY "
+                "to file types the user did not name in their instruction — it is NOT a license to invent extra folders for "
+                "files the user already routed.\n"
+                "3. FORBIDDEN folder names (catch-all junk drawers): 'misc', 'other', 'unsorted', 'miscellaneous', 'random', "
+                "'stuff', 'various', 'etc'. Never use these names. If a file truly fits nowhere meaningful, place it in the "
+                "closest existing folder by content type.\n"
+                f"4. IMPORTANT: Do NOT create a folder named '{parent_folder_name}' - use a different name.\n"
+                "5. Every file MUST be placed in exactly one folder."
             )
         else:
             full_instruction = (
