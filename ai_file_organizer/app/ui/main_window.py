@@ -1976,12 +1976,10 @@ class MainWindow(QMainWindow):
         support_layout.addLayout(email_row)
         layout.addWidget(support_card)
 
-        # AI Providers section removed - app covers AI costs for users
-        # (Hidden placeholder widgets to prevent AttributeError in event handlers)
-        self.local_ai_group = QFrame()
-        self.local_ai_group.setVisible(False)
-        self.openai_group = QFrame()
-        self.openai_group.setVisible(False)
+        # AI Providers section was removed in v12.2.0 — all AI calls now go
+        # through the Supabase Edge Function proxy (authenticated with the user's
+        # Supabase session), so users no longer need to supply their own
+        # OpenAI key. The app covers the AI cost as part of the subscription.
 
         # ======= QUICK SEARCH CARD =======
         qs_card = QFrame()
@@ -3013,17 +3011,9 @@ class MainWindow(QMainWindow):
         self.clear_all_paths_btn.clicked.connect(self._clear_all_indexed_paths)
         
         # Settings tab connections
-        # AI Provider selection
-        if hasattr(self, 'ai_provider_combo'):
-            self.ai_provider_combo.currentIndexChanged.connect(self._update_ai_provider_visibility)
-        if hasattr(self, 'check_ollama_btn'):
-            self.check_ollama_btn.clicked.connect(self._check_ollama_status)
-        if hasattr(self, 'save_local_ai_btn'):
-            self.save_local_ai_btn.clicked.connect(self.on_save_local_ai)
-        if hasattr(self, 'save_ai_settings_button'):
-            self.save_ai_settings_button.clicked.connect(self.on_save_openai)
-        if hasattr(self, 'delete_ai_key_button'):
-            self.delete_ai_key_button.clicked.connect(self.on_delete_openai_key)
+        # AI Provider selection UI was removed in v12.2.0 (the Supabase Edge
+        # Function proxy provides all AI capabilities without a user key); the
+        # only remaining AI toggle here is the search rerank feature flag.
         if hasattr(self, 'gpt_rerank_button'):
             self.gpt_rerank_button.toggled.connect(self.on_toggle_gpt_rerank)
         # Quick search settings connections
@@ -4185,34 +4175,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
-    def on_save_openai(self):
-        key = self.openai_key_input.text().strip()
-        settings.set_openai_api_key(key)
-        model = self.openai_model_combo.currentText().strip() or settings.openai_vision_model
-        settings.set_openai_vision_model(model)
-        self.status_bar.showMessage("OpenAI settings saved")
-
-    def on_delete_openai_key(self):
-        settings.delete_openai_api_key()
-        self.openai_key_input.clear()
-        self.status_bar.showMessage("OpenAI API key deleted")
-
-    def _update_ai_provider_visibility(self):
-        """Show/hide Local vs OpenAI settings based on provider selection."""
-        idx = self.ai_provider_combo.currentIndex()
-        # 0 = OpenAI, 1 = Local, 2 = None
-        self.openai_group.setVisible(idx == 0)
-        self.local_ai_group.setVisible(idx == 1)
-        
-        # Save the provider selection
-        provider_map = {0: 'openai', 1: 'local', 2: 'none'}
-        provider_names = {0: 'OpenAI (Recommended)', 1: 'Local (Ollama)', 2: 'None'}
-        settings.set_ai_provider(provider_map.get(idx, 'openai'))
-        
-        # Show status message
-        if hasattr(self, 'status_bar'):
-            self.status_bar.showMessage(f"AI Provider: {provider_names.get(idx, 'OpenAI')}")
-
     def _toggle_quick_index_options(self):
         """Toggle visibility of More Options content."""
         visible = not self.quick_index_content.isVisible()
@@ -4227,57 +4189,9 @@ class MainWindow(QMainWindow):
         arrow = "▼" if visible else "▶"
         self.advanced_header.setText(f"{arrow} Advanced")
 
-    def on_save_local_ai(self):
-        """Save local AI model settings."""
-        local_model = self.local_model_combo.currentText().strip() or settings.local_model
-        settings.set_local_model(local_model)
-        self.status_bar.showMessage(f"Local AI model saved: {local_model}")
-
-    def _check_ollama_status(self):
-        """Check if Ollama is running and list available models."""
-        import requests
-        from app.ui.organize_page import ModernInfoDialog
-        
-        try:
-            r = requests.get("http://localhost:11434/api/tags", timeout=3)
-            if r.ok:
-                data = r.json()
-                models = [m.get('name', 'unknown') for m in data.get('models', [])]
-                if models:
-                    ModernInfoDialog.show_info(
-                        self, 
-                        title="Ollama Status", 
-                        message="✓ Ollama is running!",
-                        details=[f"• {model}" for model in models],
-                        info_text="Tip: To install new models, run: ollama pull <model-name>"
-                    )
-                else:
-                    ModernInfoDialog.show_info(
-                        self, 
-                        title="Ollama Status", 
-                        message="✓ Ollama is running, but no models are installed.",
-                        info_text="Install the recommended model:\n  ollama pull qwen2.5vl:3b"
-                    )
-            else:
-                ModernInfoDialog.show_warning(
-                    self, 
-                    title="Ollama Status", 
-                    message="Ollama is not responding.",
-                    info_text="Make sure Ollama is running."
-                )
-        except requests.exceptions.ConnectionError:
-            ModernInfoDialog.show_warning(
-                self, 
-                title="Ollama Status", 
-                message="Ollama is not running.",
-                info_text="Start it by:\n1. Open a terminal\n2. Run: ollama serve\n\nOr download from: https://ollama.com"
-            )
-        except Exception as e:
-            ModernInfoDialog.show_warning(
-                self, 
-                title="Ollama Status", 
-                message=f"Error checking Ollama status:\n{str(e)}"
-            )
+    # (Removed in v12.2.0) on_save_local_ai / _check_ollama_status — the
+    # Local-AI (Ollama) settings UI was removed alongside the OpenAI key UI
+    # since all AI now flows through the Supabase Edge Function proxy.
 
     def on_toggle_gpt_rerank(self, checked: bool):
         settings.set_use_openai_search_rerank(bool(checked))

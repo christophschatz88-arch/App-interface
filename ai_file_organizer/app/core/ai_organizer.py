@@ -274,25 +274,28 @@ Return the complete updated plan as JSON only."""
 
 
 def _request_openai(user_message: str) -> Optional[Dict[str, Any]]:
-    """Request plan via OpenAI API."""
+    """Request plan via OpenAI through the Supabase Edge Function proxy."""
     try:
-        from openai import OpenAI
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            logger.error("OPENAI_API_KEY not set")
+        from .vision import _call_openai_proxy
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        resp_data = _call_openai_proxy("chat", messages, max_tokens=4000, temperature=0.1)
+        if not resp_data:
+            logger.error("OpenAI proxy returned no data for organization plan")
             return None
-        
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-            max_tokens=4000,
-        )
-        content = resp.choices[0].message.content or ""
+
+        choices = resp_data.get("choices", [])
+        if not choices:
+            logger.warning("OpenAI proxy response had no choices")
+            return None
+        content = choices[0].get("message", {}).get("content", "") or ""
+        if not content:
+            logger.warning("OpenAI proxy response had empty content")
+            return None
+
         logger.info(f"OpenAI organization response (truncated): {content[:300]}")
         return _parse_json(content)
     except Exception as e:

@@ -27,8 +27,109 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_URL = "http://localhost:11434"
 
+# Supabase Edge Function proxy: all OpenAI calls go through here so users
+# don't have to bring their own key. Auth uses the logged-in user's
+# Supabase access token; the OpenAI API key lives in Supabase secrets.
+from .supabase_client import SUPABASE_URL
+OPENAI_PROXY_URL = f"{SUPABASE_URL}/functions/v1/openai-proxy"
+
 # Import settings for dynamic model configuration
 from .settings import settings
+
+
+def _get_auth_token() -> Optional[str]:
+    """Get the current user's Supabase access token for proxy calls."""
+    try:
+        from .supabase_client import supabase_auth
+        if supabase_auth.is_authenticated:
+            return supabase_auth._access_token
+        return None
+    except Exception as e:
+        logger.error(f"Failed to get auth token: {e}")
+        return None
+
+
+def _call_openai_proxy(endpoint: str, messages: List[Dict], max_tokens: int = 500, temperature: float = 0.2) -> Optional[Dict[str, Any]]:
+    """Call OpenAI via the Supabase Edge Function proxy.
+
+    Args:
+        endpoint: 'chat' (text) or 'vision' (image).
+        messages: OpenAI-format messages array.
+        max_tokens: Response token cap.
+        temperature: Sampling temperature.
+
+    Returns:
+        OpenAI response JSON (choices/message/content shape) or None on failure.
+    """
+    try:
+        auth_token = _get_auth_token()
+        if not auth_token:
+            logger.warning("No Supabase auth token; cannot call OpenAI proxy. Sign in first.")
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "endpoint": endpoint,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        logger.info(f"Calling OpenAI proxy: endpoint={endpoint}")
+        response = requests.post(OPENAI_PROXY_URL, json=payload, headers=headers, timeout=120)
+
+        if response.status_code == 401:
+            logger.error("OpenAI proxy: 401 (auth invalid — session may have expired; please sign in again)")
+            return None
+        if response.status_code == 403:
+            logger.error("OpenAI proxy: 403 (no active subscription)")
+            return None
+        if response.status_code != 200:
+            logger.error(f"OpenAI proxy error: {response.status_code} - {response.text[:300]}")
+            return None
+
+        return response.json()
+    except requests.exceptions.Timeout:
+        logger.error("OpenAI proxy call timed out")
+        return None
+    except Exception as e:
+        logger.error(f"OpenAI proxy call failed: {e}")
+        return None
+
+
+def transcribe_audio_proxy(audio_path: str) -> Optional[str]:
+    """Transcribe an audio file using Whisper through the Supabase proxy."""
+    try:
+        auth_token = _get_auth_token()
+        if not auth_token:
+            logger.warning("No Supabase auth token; cannot call Whisper proxy.")
+            return None
+
+        with open(audio_path, "rb") as fh:
+            audio_b64 = base64.b64encode(fh.read()).decode("utf-8")
+
+        headers = {
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "endpoint": "whisper",
+            "audio_base64": audio_b64,
+            "audio_filename": os.path.basename(audio_path),
+        }
+
+        response = requests.post(OPENAI_PROXY_URL, json=payload, headers=headers, timeout=60)
+        if response.status_code != 200:
+            logger.error(f"Whisper proxy error: {response.status_code} - {response.text[:300]}")
+            return None
+
+        return response.json().get("text", "") or None
+    except Exception as e:
+        logger.error(f"Whisper transcription failed: {e}")
+        return None
 
 
 def get_local_model() -> str:
@@ -341,13 +442,8 @@ def analyze_image(image_path: Path, model: str = None, user_instructions: str = 
 
 
 def _gpt_text_analysis(text: str, filename: Optional[str] = None, user_instructions: str = None) -> Optional[Dict[str, Any]]:
-    """Analyze text content using OpenAI GPT."""
+    """Analyze text content using OpenAI through the Supabase Edge Function proxy."""
     try:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key or OpenAI is None:
-            return None
-
-        client = OpenAI(api_key=api_key)
         name_part = f"Filename: {filename}\n" if filename else ""
         snippet = (text or "").strip()
         if len(snippet) > 5000:
@@ -360,15 +456,21 @@ def _gpt_text_analysis(text: str, filename: Optional[str] = None, user_instructi
         )
 
         system = build_analysis_prompt(SYSTEM_PROMPT, user_instructions)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",  # Cost-effective for text
-            messages=[
+        resp_data = _call_openai_proxy(
+            "chat",
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
             ],
+            max_tokens=500,
             temperature=0.2,
         )
-        content = resp.choices[0].message.content or ""
+        if not resp_data:
+            return None
+        choices = resp_data.get("choices", [])
+        if not choices:
+            return None
+        content = choices[0].get("message", {}).get("content", "") or ""
         
         try:
             data = json.loads(content)
@@ -580,14 +682,10 @@ def _salvage_from_content(content: str) -> Optional[Dict[str, Any]]:
 
 
 def gpt_vision_fallback(image_b64: str, filename: Optional[str] = None, user_instructions: str = None) -> Optional[Dict[str, Any]]:
-    """Cloud fallback using OpenAI GPT-4o-mini if OPENAI_API_KEY is set.
+    """Cloud vision analysis through the Supabase Edge Function proxy.
     image_b64 should be raw base64 without data URI prefix.
     """
     try:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key or OpenAI is None:
-            return None
-        client = OpenAI(api_key=api_key)
         system = build_analysis_prompt(DETAILED_SYSTEM_PROMPT, user_instructions)
         # Build data URL for inline base64 image
         data_url = f"data:image/png;base64,{image_b64}"
@@ -596,15 +694,22 @@ def gpt_vision_fallback(image_b64: str, filename: Optional[str] = None, user_ins
             user_content.append({"type": "text", "text": f"filename: {filename}"})
         user_content.append({"type": "text", "text": "Return STRICT JSON only using the schema."})
         user_content.append({"type": "image_url", "image_url": {"url": data_url}})
-        resp = client.chat.completions.create(
-            model=get_openai_vision_model(),
-            messages=[
+
+        resp_data = _call_openai_proxy(
+            "vision",
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
+            max_tokens=500,
             temperature=0.2,
         )
-        content = resp.choices[0].message.content or ""
+        if not resp_data:
+            return None
+        choices = resp_data.get("choices", [])
+        if not choices:
+            return None
+        content = choices[0].get("message", {}).get("content", "") or ""
         try:
             data = json.loads(content)
         except Exception:

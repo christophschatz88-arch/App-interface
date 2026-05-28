@@ -114,8 +114,7 @@ class VoiceRecordWorker(QThread):
             from scipy.io import wavfile
             import tempfile
             import os
-            from openai import OpenAI
-            from app.core.settings import settings
+            from app.core.vision import transcribe_audio_proxy
             
             self.is_recording = True
             self.audio_data = []
@@ -145,17 +144,12 @@ class VoiceRecordWorker(QThread):
                 wavfile.write(temp_path, self.sample_rate, audio)
             
             try:
-                # Transcribe with OpenAI Whisper
-                client = OpenAI(api_key=settings.openai_api_key)
-                
-                with open(temp_path, 'rb') as audio_file:
-                    transcription = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        language="en"
-                    )
-                
-                self.finished.emit(transcription.text)
+                # Transcribe via the Supabase Edge Function Whisper proxy.
+                text = transcribe_audio_proxy(temp_path)
+                if text is None:
+                    self.error.emit("Voice transcription failed — please sign in and try again.")
+                else:
+                    self.finished.emit(text)
             finally:
                 # Clean up temp file
                 try:
@@ -6095,26 +6089,21 @@ class OrganizePage(QWidget):
             except Exception:
                 pass
         
-        # Ask user what to do with existing files
-        organize_existing = False
-        flatten_first = False
-        
-        total_items = existing_count + subfolder_count
-        if total_items > 0 and not is_catch_up and not skip_existing_popup:
-            dialog = ApplyInstructionsDialog(self, existing_count, subfolder_count)
-            dialog.exec()
-            
-            if dialog.result_choice == ApplyInstructionsDialog.REORGANIZE_ALL:
-                organize_existing = True
-                flatten_first = True
-            elif dialog.result_choice == ApplyInstructionsDialog.ORGANIZE_AS_IS:
-                organize_existing = True
-            # else: CONTINUE_WATCHING - just watch, don't organize existing
-        elif is_catch_up:
-            organize_existing = True
-        
-        # Start the watcher
-        self.auto_watcher.start(organize_existing=organize_existing, flatten_first=flatten_first)
+        # No popup on Start Watching. The per-folder action (Re-organize All /
+        # As-Is / Watch Only) is set via each folder's Options button, and is
+        # applied immediately by the configure dialog's Save (see
+        # WatchConfigDialog._save_and_close → organize_single_folder). Starting
+        # the watcher here is purely about kicking off the periodic
+        # file-detection timer — never re-ask the user.
+        #
+        # The one exception is catch-up mode: if the app was previously running
+        # and was closed, we re-organize existing files on startup so anything
+        # added while the app was offline gets picked up.
+        organize_existing = bool(is_catch_up)
+
+        # Start the watcher (periodic timer; per-folder organize already
+        # happened via Save when the user picked their action).
+        self.auto_watcher.start(organize_existing=organize_existing, flatten_first=False)
         
     def _stop_watch_mode(self):
         """Stop watching folders."""

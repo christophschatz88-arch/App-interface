@@ -475,8 +475,14 @@ class Settings:
                 return
 
     def update_auto_organize_action(self, folder_path: str, action: int) -> None:
-        """Update the organization action for a folder.
-        
+        """Update (or insert) the organization action for a folder.
+
+        If the folder isn't registered yet in auto_organize_folders, it is
+        created on the spot. This matters when the user picks a per-folder
+        action via the Options button *before* clicking the main Save — the
+        choice would otherwise be silently dropped because the folder didn't
+        yet exist in settings.
+
         Args:
             folder_path: Path to the folder
             action: 1=Re-organize All, 2=Organize As-Is, 3=Watch Only
@@ -486,6 +492,15 @@ class Settings:
                 folder['action'] = action
                 self._save_config()
                 return
+        # Folder not registered yet — create it with the chosen action so the
+        # user's pick is persisted immediately. Instruction stays empty until
+        # the main Save flow writes it.
+        self.auto_organize_folders.append({
+            'path': folder_path,
+            'instruction': '',
+            'action': action,
+        })
+        self._save_config()
     
     def get_auto_organize_action(self, folder_path: str) -> int:
         """Get the organization action for a folder.

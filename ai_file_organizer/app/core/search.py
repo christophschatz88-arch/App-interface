@@ -872,15 +872,8 @@ class SearchService:
         return enhanced
 
     def _gpt_rerank_results(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Use OpenAI to rerank a small candidate set using a cheap model."""
-        try:
-            from openai import OpenAI
-        except Exception:
-            return []
-        try:
-            client = OpenAI()
-        except Exception:
-            return []
+        """Rerank a small candidate set via the Supabase OpenAI proxy."""
+        from .vision import _call_openai_proxy
         import json as _json
         items = []
         for c in candidates:
@@ -898,15 +891,21 @@ class SearchService:
         )
         user = [{"type": "text", "text": f"Query: {query}\nItems: {_json.dumps(items)}\nReturn: [ids in best->worst order]"}]
         try:
-            resp = client.chat.completions.create(
-                model=settings.openai_search_model,
-                messages=[
+            resp_data = _call_openai_proxy(
+                "chat",
+                [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
+                max_tokens=500,
                 temperature=0.0,
             )
-            content = resp.choices[0].message.content or ""
+            if not resp_data:
+                return []
+            choices = resp_data.get("choices", [])
+            if not choices:
+                return []
+            content = choices[0].get("message", {}).get("content", "") or ""
             s = content.find('['); e = content.rfind(']')
             if s != -1 and e != -1 and e > s:
                 import json

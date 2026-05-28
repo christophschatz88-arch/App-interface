@@ -9,6 +9,7 @@ import os
 import shutil
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Set
@@ -130,42 +131,56 @@ class AutoWatcherWorker(QThread):
             search_service = SearchService()
             indexed_count = 0
             
+            # Index files in PARALLEL (mirrors the manual-indexing path), so
+            # when several new files appear at once the vision API calls run
+            # concurrently instead of one-by-one. Cap by MAX_CONCURRENT_AI_REQUESTS.
+            from app.core.search import MAX_CONCURRENT_AI_REQUESTS
+            workers = max(1, min(MAX_CONCURRENT_AI_REQUESTS, len(files_to_index)))
+            total = len(files_to_index)
             limit_reached = False
-            for i, file_path in enumerate(files_to_index):
-                if self._should_stop:
-                    self.finished_processing.emit(all_processed_files)
-                    return
-                
-                # Stop indexing if limit was reached on a previous file
-                if limit_reached:
-                    logger.info(f"[Worker] Skipping remaining {len(files_to_index) - i} files due to index limit")
-                    break
-                    
+            limit_signal_emitted = False
+
+            def _index_one(fp: str):
                 try:
-                    result = search_service.index_single_file(Path(file_path), force_ai=False)
-                    
+                    return fp, search_service.index_single_file(Path(fp), force_ai=False)
+                except Exception as exc:
+                    return fp, {'error': str(exc)}
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(_index_one, fp): fp for fp in files_to_index}
+                for fut in as_completed(futures):
+                    if self._should_stop:
+                        for f in futures:
+                            f.cancel()
+                        self.finished_processing.emit(all_processed_files)
+                        return
+                    try:
+                        file_path, result = fut.result()
+                    except Exception as e:
+                        logger.error(f"[Worker] Indexing future failed: {e}")
+                        continue
+
                     if result.get('success'):
                         indexed_count += 1
                         logger.info(f"[Worker] Auto-indexed: {os.path.basename(file_path)}")
                         self.file_indexed.emit(file_path)
-                        self.status_changed.emit(f"Indexed {indexed_count}/{len(files_to_index)} files...")
+                        self.status_changed.emit(f"Indexed {indexed_count}/{total} files...")
                     elif result.get('limit_reached'):
-                        # Index limit reached - stop trying to index more media files
+                        # Index limit hit — stop submitting more work, but let
+                        # in-flight tasks finish naturally; emit the upgrade
+                        # signal once per run.
                         limit_reached = True
                         logger.warning(f"[Worker] Index limit reached: {result.get('error')}")
                         self.status_changed.emit("Index limit reached - upgrade for more")
                         self.error_occurred.emit(file_path, result.get('error', 'Index limit reached'))
-                        # Surface to the UI so the upgrade popup can be shown (once per run).
-                        self.limit_reached.emit({})
+                        if not limit_signal_emitted:
+                            limit_signal_emitted = True
+                            self.limit_reached.emit({})
+                        for f in futures:
+                            f.cancel()
+                        break
                     elif result.get('error'):
                         logger.warning(f"[Worker] Failed to index {file_path}: {result.get('error')}")
-                    
-                    # Small delay between files
-                    if i < len(files_to_index) - 1:
-                        time.sleep(0.3)
-                        
-                except Exception as e:
-                    logger.error(f"[Worker] Error auto-indexing {file_path}: {e}")
             
             if indexed_count > 0:
                 self.status_changed.emit(f"Indexed {indexed_count} file(s), now organizing...")
@@ -488,10 +503,28 @@ class AutoOrganizeWatcher(QObject):
         self._is_running = True
         self._processed_files.clear()
         self._pending_files.clear()
-        
+
+        # Snapshot every file currently in the watched folders (root AND
+        # subfolders). Files in this snapshot are treated as "already known"
+        # so the periodic checker only fires on files added AFTER start.
+        # Pre-existing files are either already organized (sitting in their
+        # subfolders) or were left in place intentionally — either way the
+        # watcher shouldn't keep re-processing them every cycle.
+        for folder in self.watched_folders:
+            folder = os.path.normpath(folder)
+            if not os.path.isdir(folder):
+                continue
+            for root, dirs, files in os.walk(folder):
+                # Skip hidden subdirs in-place
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for fn in files:
+                    if self._should_ignore(fn):
+                        continue
+                    self._processed_files.add(os.path.normpath(os.path.join(root, fn)))
+
         folder_count = len(self.watched_folders)
         self.status_changed.emit(f"Starting watch on {folder_count} folder(s)...")
-        logger.info(f"Starting watcher for {folder_count} folders")
+        logger.info(f"Starting watcher for {folder_count} folders (snapshot has {len(self._processed_files)} pre-existing files)")
         
         # Flatten folders first if requested (for re-organize)
         if flatten_first:
@@ -744,10 +777,28 @@ class AutoOrganizeWatcher(QObject):
         return False
     
     def _get_instruction_for_folder(self, folder_path: str) -> str:
-        """Get the instruction for a specific folder."""
+        """Get the CURRENT instruction for a specific folder.
+
+        Reads live from settings (the source of truth, updated immediately
+        when the user edits the instruction in the UI) so the watcher and the
+        re-organize flow always honor the latest edits — without needing the
+        watcher to be restarted or having to push updates through other paths.
+        Falls back to the in-memory cache for legacy/test callers that pre-set
+        instructions there.
+        """
         folder_path = os.path.normpath(folder_path)
+        try:
+            from app.core.settings import settings
+            for f in settings.auto_organize_folders:
+                if os.path.normpath(f.get('path', '')) == folder_path:
+                    instruction = f.get('instruction', '') or ''
+                    logger.debug(f"Instruction (live) for {folder_path}: {instruction[:50] if instruction else '(none)'}")
+                    return instruction
+        except Exception as e:
+            logger.warning(f"Could not read live instruction from settings: {e}")
+        # Fallback to the cached dict
         instruction = self.folder_instructions.get(folder_path, '')
-        logger.debug(f"Instruction for {folder_path}: {instruction[:50] if instruction else '(none)'}")
+        logger.debug(f"Instruction (cache) for {folder_path}: {instruction[:50] if instruction else '(none)'}")
         return instruction
 
     def _get_existing_folders_if_as_is(self, folder_path: str) -> list:
@@ -1013,35 +1064,42 @@ class AutoOrganizeWatcher(QObject):
             folder = os.path.normpath(folder)
             if not os.path.isdir(folder):
                 continue
-            
+
             try:
-                for item in os.listdir(folder):
-                    item_path = os.path.join(folder, item)
-                    
-                    if not os.path.isfile(item_path):
-                        continue
-                    
-                    if self._should_ignore(item):
-                        continue
-                    
-                    # Skip already processed files
-                    if item_path in self._processed_files:
-                        continue
-                    
-                    # Track pending files for debounce
-                    if item_path not in self._pending_files:
-                        self._pending_files[item_path] = current_time
-                        logger.debug(f"New file detected: {item_path}")
-                    else:
-                        # Check if file has been stable long enough
-                        first_seen = self._pending_files[item_path]
-                        if current_time - first_seen >= self._debounce_seconds:
-                            # File is stable, process it
-                            instruction = self._get_instruction_for_folder(folder)
-                            existing_folders = self._get_existing_folders_if_as_is(folder)
-                            self._process_files_with_ai([item_path], folder, instruction, existing_folders)
-                            self._pending_files.pop(item_path, None)
-                            
+                # Walk the WHOLE tree (root + subfolders) so a file dropped
+                # into a subfolder is also detected. Files that existed when
+                # the watcher started were added to _processed_files in
+                # start(); files we've organized are tracked in
+                # _organized_files. Anything outside both sets is genuinely
+                # new and should be routed by the current instruction.
+                for root, dirs, files in os.walk(folder):
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for item in files:
+                        item_path = os.path.normpath(os.path.join(root, item))
+
+                        if self._should_ignore(item):
+                            continue
+                        if item_path in self._processed_files:
+                            continue
+                        if item_path in self._organized_files:
+                            continue
+
+                        # Track pending files for debounce
+                        if item_path not in self._pending_files:
+                            self._pending_files[item_path] = current_time
+                            logger.debug(f"New file detected: {item_path}")
+                        else:
+                            # Check if file has been stable long enough
+                            first_seen = self._pending_files[item_path]
+                            if current_time - first_seen >= self._debounce_seconds:
+                                # File is stable, process it with the WATCHED
+                                # root folder context (not the subfolder), so
+                                # the AI plan routes it relative to the watched
+                                # folder structure.
+                                instruction = self._get_instruction_for_folder(folder)
+                                existing_folders = self._get_existing_folders_if_as_is(folder)
+                                self._process_files_with_ai([item_path], folder, instruction, existing_folders)
+                                self._pending_files.pop(item_path, None)
             except Exception as e:
                 logger.error(f"Error checking folder {folder}: {e}")
     
@@ -1084,18 +1142,23 @@ class AutoOrganizeWatcher(QObject):
                 f"[AUTO-ORGANIZE] User's specific instructions: {instruction}\n\n"
                 f"PARENT FOLDER NAME: '{parent_folder_name}' - DO NOT create a folder with this name!\n\n"
                 "RULES FOR AUTO-ORGANIZE MODE:\n"
-                "1. STRICT: Files of any TYPE the user explicitly mentioned MUST go to the folder the user named for that type. "
-                "No exceptions, no alternative folders. If the user said 'videos to Clips', EVERY video file goes to 'Clips' — "
-                "do NOT route any video to a different folder (no 'media', no 'videos', no 'Clips_2').\n"
-                "2. ONLY for files of types the user did NOT mention may you create a new, meaningful folder by content type "
-                "(e.g. 'documents' for text/PDFs, 'audio' for music, 'code' for source files). This permission applies STRICTLY "
-                "to file types the user did not name in their instruction — it is NOT a license to invent extra folders for "
-                "files the user already routed.\n"
-                "3. FORBIDDEN folder names (catch-all junk drawers): 'misc', 'other', 'unsorted', 'miscellaneous', 'random', "
+                "1. CRITICAL — TAGS ARE AUTHORITATIVE: classify each file by its tags FIRST, the filename is only a fallback. "
+                "If a file's tags contain a topic that matches a user-named folder (e.g. tags include 'lion' and the user "
+                "named a 'lions' folder), the file MUST go to that folder, even if the filename does not obviously suggest it. "
+                "A photo whose filename is 'hassan-pond.jpg' but whose tags include 'lion' is a LION photo and belongs in the "
+                "lions folder.\n"
+                "2. STRICT: Files of any TYPE/SUBJECT the user explicitly mentioned MUST go to the folder the user named for "
+                "that subject. No exceptions, no alternative folders. If the user said 'videos to Clips', EVERY video file "
+                "goes to 'Clips' — do NOT route any video to a different folder (no 'media', no 'videos', no 'Clips_2').\n"
+                "3. ONLY for files whose tags/subject the user did NOT mention may you create a new, meaningful folder by "
+                "content type (e.g. 'documents' for text/PDFs, 'audio' for music, 'code' for source files). This permission "
+                "applies STRICTLY to subjects the user did not name in their instruction — it is NOT a license to invent extra "
+                "folders for files the user already routed.\n"
+                "4. FORBIDDEN folder names (catch-all junk drawers): 'misc', 'other', 'unsorted', 'miscellaneous', 'random', "
                 "'stuff', 'various', 'etc'. Never use these names. If a file truly fits nowhere meaningful, place it in the "
                 "closest existing folder by content type.\n"
-                f"4. IMPORTANT: Do NOT create a folder named '{parent_folder_name}' - use a different name.\n"
-                "5. Every file MUST be placed in exactly one folder."
+                f"5. IMPORTANT: Do NOT create a folder named '{parent_folder_name}' - use a different name.\n"
+                "6. Every file MUST be placed in exactly one folder."
             )
         else:
             full_instruction = (
