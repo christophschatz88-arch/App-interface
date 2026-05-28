@@ -30,27 +30,31 @@ ORGANIZATION_SCHEMA = """{
 
 SYSTEM_PROMPT = f"""You are a file organization assistant. Given a user's instruction and files with metadata, propose how to organize them into folders.
 
+CRITICAL: FOLLOW USER INSTRUCTIONS LITERALLY
+- The user's instruction is the PRIMARY directive - follow it EXACTLY
+- If user says "move all files to X" or "put all files in X", put ALL files in folder "X" - no exceptions
+- Do NOT organize by file type unless the user specifically asks for it
+- Do NOT create additional folders beyond what the user requested
+
+FRESH START ON EVERY REQUEST:
+- Each instruction is a NEW organization request
+- Files may currently be in subfolders - their current folder is shown in the "folder" field
+- Use the current folder information when the user asks to preserve specific folders
+
 FILE INFORMATION PROVIDED:
 - id: unique file identifier (use this in your response)
 - name: the filename
 - folder: the current subfolder the file lives in (or "." if at the root level)
-- ext: the FILE EXTENSION (e.g., .mp4, .json, .png, .pdf) - USE THIS to identify file types!
+- ext: the FILE EXTENSION (e.g., .mp4, .json, .png, .pdf)
 - label/tags/caption: AI-generated descriptions
 
 STRICT RULES:
 1. Return ONLY valid JSON matching this schema:
 {ORGANIZATION_SCHEMA}
 
-2. folder-name: descriptive, lowercase, kebab-case (e.g., "screenshots", "videos", "documents")
+2. folder-name: use EXACTLY what the user specifies, or lowercase kebab-case if organizing by type
 3. Use ONLY file_ids from the provided list - NEVER invent IDs
-4. USE THE FILE EXTENSION (ext:) to identify file types:
-   - "videos" = .mp4, .mov, .avi, .mkv, .webm
-   - "images/photos" = .jpg, .jpeg, .png, .gif, .webp
-   - "screenshots" = .png files with "screenshot" in name OR tagged as screenshot
-   - "JSON files" = .json
-   - "PDFs" = .pdf
-   - "documents" = .doc, .docx, .pdf, .txt
-   - "audio" = .mp3, .wav, .m4a, .flac
+4. By default, EVERY file_id must appear in exactly ONE folder — UNLESS the user asks to preserve specific folders (see below)
 5. Maximum 2 folder levels
 6. Do NOT rename files - only organize into folders
 7. NEVER return empty folders - every folder must have at least one file
@@ -62,23 +66,21 @@ PRESERVE INSTRUCTIONS (e.g., "keep X as is", "preserve folder X", "don't touch X
 - Example: "organize everything but preserve Work Projects" → include all files EXCEPT those with folder:"Work Projects"
 - Only omit files for folders the user explicitly names — organize everything else normally
 
-TWO MODES OF OPERATION:
+INSTRUCTION INTERPRETATION:
 
-MODE 1 - REGULAR ORGANIZE (instruction does NOT start with [AUTO-ORGANIZE]):
-- ONLY include files that SPECIFICALLY MATCH the user's instruction
-- Leave ALL other files OUT of the response
-- It's OK to return fewer files than provided
-- Do NOT create "misc" or "other" folders
+SIMPLE MOVE INSTRUCTIONS (e.g., "move all files to X", "put everything in X", "move files to folder called X"):
+- Put ALL files in the single folder the user specified
+- Do NOT create any other folders
+- Do NOT organize by type - just move everything to that one folder
+- Example: "move all files to hello" → {{"folders": {{"hello": [1, 2, 3, 4, 5, ...]}}}}
 
-MODE 2 - AUTO-ORGANIZE (instruction starts with [AUTO-ORGANIZE]):
-- Follow user's specific instructions EXACTLY for mentioned file types
-- ALSO organize ALL remaining files by their file type
-- EVERY file MUST be included - no file left out (unless user explicitly asks to preserve a folder)
-- Example: "screenshots to screenshots-folder" means:
-  * Screenshots → "screenshots-folder" (as user specified)
-  * Videos → "videos" (organized by type)
-  * Documents → "documents" (organized by type)
-  * etc.
+TYPE-BASED INSTRUCTIONS (e.g., "organize by type", "sort files by extension", "put videos in videos folder"):
+- Only then organize files by their type/extension
+- Use file extensions to determine type
+
+MIXED INSTRUCTIONS (e.g., "put screenshots in screenshots, organize rest by type"):
+- Follow the specific instruction for mentioned types
+- Organize remaining files by type
 
 JSON only. No markdown. No explanation. No prose."""
 
@@ -131,19 +133,26 @@ def build_file_summary(files: List[Dict[str, Any]], max_files: int = 300) -> str
     lines = []
     for f in files[:max_files]:
         fid = f.get('id')
-        name = f.get('file_name', 'unknown')[:50]
+        full_name = f.get('file_name', 'unknown')
+        # Extract the ext from the FULL filename BEFORE truncating for display.
+        # Otherwise long names like "1000_F_…_n7pMsr8Jt3UlNfXbr7Z5WbgIQTxkzvAc.jpg"
+        # get sliced at 50 chars (which can land mid-extension or strip it
+        # entirely), leaving the AI with a junk `ext:.` or empty `ext:` field
+        # and no signal that the file is actually a .jpg/.webp image.
+        ext = ''
+        if '.' in full_name:
+            ext = full_name[full_name.rfind('.'):].lower()
+        name = full_name[:50]
         label = f.get('label', '') or ''
         caption = (f.get('caption', '') or '')[:80]
         tags = f.get('tags', []) or []
         subfolder = f.get('subfolder', '.') or '.'
 
-        # Extract file extension for accurate type matching
-        ext = ''
-        if '.' in name:
-            ext = name[name.rfind('.'):].lower()
-
-        # Add inferred hints from filename patterns
-        hints = _infer_file_type_hints(name)
+        # Add inferred hints from filename patterns. Use the FULL name (not
+        # the 50-char display copy) so patterns living past position 50 —
+        # e.g. "screen_shot" inside a very long path component — still
+        # contribute a hint. Mirrors the ext fix above; same root cause.
+        hints = _infer_file_type_hints(full_name)
         all_tags = list(tags[:8]) + hints
         tags_str = ', '.join(all_tags) if all_tags else ''
 
@@ -158,6 +167,217 @@ def build_file_summary(files: List[Dict[str, Any]], max_files: int = 300) -> str
         summary += f"\n... and {len(files) - max_files} more files"
     
     return summary
+
+
+# ─────────────────────────────────────────────────────────────
+# DETERMINISTIC TAG-BASED SAFETY NET
+# ─────────────────────────────────────────────────────────────
+# Even with the cleanest possible prompt, the LLM sometimes refuses to use
+# a file's `tag:tiger` as the deciding signal when the FILENAME looks like
+# something else (e.g. Adobe Stock URLs, base64-encoded image URLs). It
+# invents alternate buckets — "documents", "images" — that the user never
+# asked for.
+#
+# The safety net runs AFTER the LLM returns its plan and AUTHORITATIVELY
+# rewrites any placement that violates a tag→user-named-folder rule the
+# user explicitly stated in their instruction. The user is the source of
+# truth; the LLM is a hint generator.
+# ─────────────────────────────────────────────────────────────
+
+
+def _stem_category(word: str) -> str:
+    """Light stemmer for category words.
+
+    Drops trailing run of ``s``/``z`` so plurals and a common class of
+    misspellings collapse to the same root: ``tigers``/``tigerss``/``tigerz``
+    all become ``tiger``; ``lions``/``lionsss`` become ``lion``. Words too
+    short to safely strip (e.g. ``as``, ``is``) are returned untouched.
+    """
+    import re
+    w = (word or '').lower().strip()
+    if len(w) <= 3:
+        return w
+    stripped = re.sub(r'[sz]+$', '', w)
+    return stripped if len(stripped) >= 3 else w
+
+
+def _extract_category_to_folder_map(user_instruction: str) -> Dict[str, str]:
+    """Best-effort: parse the user's instruction for ``category → folder`` pairs.
+
+    Supported phrasings (case-insensitive), with optional ``all the`` /
+    ``move`` / quotes around the folder name:
+
+    * ``move all the tigers in a folder called hello``  →  ``{tiger: hello}``
+    * ``put X in folder named Y``                       →  ``{X: Y}``
+    * ``X(s) in the Y folder``                          →  ``{X: Y}``
+
+    Returns an empty dict if the instruction has no extractable mapping —
+    in which case the safety net is a no-op.
+    """
+    if not user_instruction:
+        return {}
+    import re
+
+    text = user_instruction
+    # Strip the boilerplate prefix the watcher adds so the regex anchors
+    # against actual user words.
+    for marker in ("User's specific instructions:", "User's instructions:"):
+        if marker in text:
+            text = text.split(marker, 1)[1]
+            break
+    text = text.strip()
+
+    mapping: Dict[str, str] = {}
+    stopwords = {
+        'a', 'an', 'the', 'all', 'every', 'any', 'and', 'or', 'but',
+        'move', 'put', 'send', 'place', 'organize', 'sort', 'files',
+        'file', 'them', 'it', 'this', 'that', 'these', 'those',
+    }
+
+    # Pattern A: "<category>(s|z) in/to [a|the] folder [called|named] <folder>"
+    # The folder name is captured until the next sentence boundary or
+    # conjunction so multi-word names like 'everything else' stay whole.
+    pattern_a = re.compile(
+        r'(?P<cat>\b[A-Za-z][A-Za-z\-]{1,29})\b'
+        r'\s+(?:in|to|into|go(?:es)?\s+to)\s+'
+        r'(?:a\s+|the\s+)?folder\s+'
+        r'(?:called|named)\s+'
+        r'[\'"]?(?P<folder>[A-Za-z0-9][\w \-]{0,40}?)[\'"]?'
+        r'(?=\s+(?:and|or|but|except|where|to|in|on|into|onto)\b|[\'",.;!?\n]|$)',
+        flags=re.IGNORECASE,
+    )
+
+    # Pattern B: "<category>(s|z) in/to [a|the] <folder> folder"
+    # ('lions in lions folder, pigs in pigs folder')
+    pattern_b = re.compile(
+        r'(?P<cat>\b[A-Za-z][A-Za-z\-]{1,29})\b'
+        r'\s+(?:in|to|into)\s+'
+        r'(?:a\s+|the\s+)?'
+        r'(?P<folder>[A-Za-z0-9][\w\-]{0,40})\s+folder\b',
+        flags=re.IGNORECASE,
+    )
+
+    for pat in (pattern_a, pattern_b):
+        for m in pat.finditer(text):
+            cat = m.group('cat').strip().lower()
+            folder = m.group('folder').strip().strip("'\"").strip()
+            if not cat or not folder:
+                continue
+            if cat in stopwords or folder.lower() in stopwords:
+                continue
+            root = _stem_category(cat)
+            if not root or len(root) < 2:
+                continue
+            # First win — don't overwrite an existing mapping. The user's
+            # instruction is read left-to-right; the earliest mention is
+            # the most explicit assignment.
+            mapping.setdefault(root, folder)
+    return mapping
+
+
+def _apply_tag_safety_net(
+    plan: Dict[str, Any],
+    files: List[Dict[str, Any]],
+    user_instruction: str,
+    existing_folders_only: bool = False,
+) -> Dict[str, Any]:
+    logger.info(
+        f"[SafetyNet] Entry: {len(files)} files, plan folders={list((plan or {}).get('folders', {}).keys())}, "
+        f"existing_folders_only={existing_folders_only}, instruction[:60]={user_instruction[:60]!r}"
+    )
+    """Rewrite any AI placement that violates a tag→user-named-folder mapping.
+
+    For each file in the plan, if any tag matches a category root the user
+    named, the file is moved to the user's named folder — overriding the
+    LLM's choice. Files with no tag match are left exactly where the LLM
+    placed them.
+
+    In ``existing_folders_only`` (Organize As-Is) mode, the rewrite is
+    skipped if the target folder isn't in the existing-folders list parsed
+    from the instruction — so the safety net never invents new folders that
+    the As-Is contract forbids.
+    """
+    if not isinstance(plan, dict):
+        return plan
+
+    cat_map = _extract_category_to_folder_map(user_instruction)
+    logger.info(f"[SafetyNet] Extracted category map: {cat_map}")
+    if not cat_map:
+        logger.info("[SafetyNet] Empty category map -> no-op return")
+        return plan
+
+    folders = plan.get('folders')
+    if not isinstance(folders, dict) or not folders:
+        return plan
+
+    # Build id → tags lookup
+    file_tags: Dict[int, List[str]] = {}
+    for f in files:
+        try:
+            fid = int(f.get('id'))
+        except (TypeError, ValueError):
+            continue
+        raw = f.get('tags') or []
+        file_tags[fid] = [str(t).lower().strip() for t in raw if t]
+    # Diagnostic — surface every (id, tags) pair so we can see what shape the
+    # caller actually passed in. This is what determines whether a tag rule
+    # can match.
+    logger.info(f"[SafetyNet] file_tags built: {file_tags}")
+
+    # If As-Is mode, parse the existing folders list out of the instruction
+    existing_lower: Optional[set] = None
+    if existing_folders_only:
+        import re
+        m = re.search(r'EXISTING FOLDERS YOU CAN USE:\s*(.+)', user_instruction or '')
+        if m:
+            raw = m.group(1).split('\n', 1)[0]
+            existing_lower = {
+                p.strip().strip("'\"").lower()
+                for p in raw.split(',')
+                if p.strip()
+            }
+        else:
+            existing_lower = set()
+
+    # Walk the plan and rebuild it with rewrites applied
+    rewritten: Dict[str, List[int]] = {}
+    rewrite_count = 0
+    for ai_folder, file_ids in folders.items():
+        if not isinstance(file_ids, (list, tuple)):
+            continue
+        for fid in file_ids:
+            try:
+                fid_int = int(fid)
+            except (TypeError, ValueError):
+                continue
+
+            chosen = ai_folder
+            tags = file_tags.get(fid_int, [])
+            for root, dest in cat_map.items():
+                # Check every tag (and its stem) for a match against this root
+                if any(t == root or _stem_category(t) == root for t in tags):
+                    if existing_lower is not None and dest.lower() not in existing_lower:
+                        # In As-Is mode, never invent a folder the AI/user
+                        # rule names but that doesn't exist on disk.
+                        continue
+                    if chosen != dest:
+                        rewrite_count += 1
+                        logger.info(
+                            f"[SafetyNet] Rerouting file_id={fid_int} from "
+                            f"'{chosen}' to '{dest}' (tag '{root}' matches user rule)"
+                        )
+                    chosen = dest
+                    break
+
+            rewritten.setdefault(chosen, []).append(fid_int)
+
+    if rewrite_count:
+        logger.info(
+            f"[SafetyNet] Applied {rewrite_count} tag-based rerouting(s); "
+            f"category map: {cat_map}"
+        )
+
+    return {'folders': rewritten}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -184,64 +404,140 @@ def request_organization_plan(
     
     # Detect auto-organize mode vs specific instruction mode
     is_auto_organize = user_instruction.startswith("[AUTO-ORGANIZE]")
+
+    # Check for different auto-organize modes
     is_existing_folders_only = "EXISTING FOLDERS ONLY" in user_instruction
+    has_user_instruction = "User's specific instructions:" in user_instruction
 
     if is_auto_organize and is_existing_folders_only:
-        # MODE A — ORGANIZE AS-IS: the AI MUST use only the folders already
-        # passed in the instruction. No new folders, no misc, no catch-all.
+        # ORGANIZE AS-IS MODE: Must use only existing folders (passed in instruction)
         user_message = f"""User instruction: "{user_instruction}"
 
 Files to organize ({len(files)} total):
 {file_summary}
 
 CRITICAL - EXISTING FOLDERS ONLY:
-- You can ONLY use the folders listed in the instruction - DO NOT create new folders
-- Put each file in the MOST APPROPRIATE existing folder based on file type/content
-- You MUST include EVERY file_id in your response ({len(files)} total)
-- Each file_id must appear in exactly ONE folder
-- Use your best judgment to match files to the closest existing folder
+- You can ONLY use the folders listed in the instruction - DO NOT create new folders.
+- For each file, look at its tags / label / caption first. If the file clearly belongs in one of the existing folders (e.g. a file tagged 'bear' when there's a 'Bears' or 'animals/Bears' folder), place it there. Filename is a secondary signal.
+- Each file_id may appear in AT MOST one folder. If a file genuinely fits no existing folder, OMIT IT from your response — do NOT invent a new folder for it, and do NOT force it into the closest-sounding existing folder. The app will leave omitted files in place on disk.
+- It is fine for your response to cover only a subset of file_ids.
+- Each file_id must appear in exactly ONE folder OR be omitted entirely; never both.
 
 Propose an organization plan. Return JSON only."""
-    elif is_auto_organize:
-        # Auto-organize: MUST include ALL files
+    elif is_auto_organize and has_user_instruction:
+        # Auto-organize WITH user instruction: follow user instruction, route any
+        # un-covered file to the CLOSEST user-specified folder (do NOT invent
+        # additional folders like "documents", "misc", or "other"). This is the
+        # Mac prompt's key insight: rather than letting the AI guess a catch-all
+        # name, force it to reuse one of the user's own named folders.
         user_message = f"""User instruction: "{user_instruction}"
 
 Files to organize ({len(files)} total):
 {file_summary}
 
-CRITICAL OVERRIDE FOR AUTO-ORGANIZE:
+CRITICAL RULES:
+- FOLLOW the user's specific instructions EXACTLY
+- ONLY create folders that the user explicitly mentioned - do NOT invent additional folders
+- For any file not clearly covered by the instruction, place it in whichever user-specified folder is the closest match
 - You MUST include EVERY file_id in your response
 - Each file_id must appear in exactly ONE folder
-- Do NOT skip any files
-- If a file doesn't fit a category, put it in 'misc' or 'other'
 - Total files in your response must equal {len(files)}
 
 Propose an organization plan. Return JSON only."""
-    else:
-        # Specific instruction: only organize matching files
-        user_message = f"""User instruction: "{user_instruction}"
+    elif is_auto_organize:
+        # Auto-organize WITHOUT specific instruction: let AI decide best organization
+        user_message = f"""Analyze these files and organize them in the SMARTEST way possible.
 
-Files available ({len(files)} total):
+Files to organize ({len(files)} total):
 {file_summary}
 
-IMPORTANT - SPECIFIC INSTRUCTION MODE:
-- ONLY include files that EXACTLY match what the user asked for
-- If user says "move screenshots to X and JSON to Y", ONLY include screenshot files and JSON files
-- Do NOT include any other files in your response
-- The total number of files in your response should be MUCH LESS than {len(files)} 
-- Leave all non-matching files OUT of the response entirely (they will stay in place)
+ANALYZE THE FILES and choose the BEST organization approach:
+- If files seem related to different PROJECTS → organize by project name
+- If files seem related to different CLIENTS/PEOPLE → organize by client/person
+- If files seem related to different TOPICS/SUBJECTS → organize by topic
+- If files seem related to different EVENTS/DATES → organize by event
+- If files are just random mixed types → organize by file type (photos, videos, docs, etc.)
+
+CRITICAL RULES:
+- LOOK at the file names and tags to understand what they are about
+- Choose folder names that MAKE SENSE for these specific files
+- Use CLEAR, DESCRIPTIVE folder names (not generic like "folder1")
+- DO NOT put all files in a single folder - create a logical structure
+- You MUST include EVERY file_id in your response ({len(files)} total)
+- Each file_id must appear in exactly ONE folder
+- Create 2-5 folders depending on how the files naturally group
+
+Examples:
+- Project files: {{"folders": {{"website-redesign": [1,2,3], "mobile-app": [4,5], "marketing": [6,7,8]}}}}
+- Mixed types: {{"folders": {{"photos": [1,2,3], "videos": [4,5], "documents": [6,7,8]}}}}
+
+Propose an organization plan. Return JSON only."""
+    else:
+        # Manual organization (non-auto) with user instruction (or empty instruction)
+        if user_instruction and user_instruction.strip():
+            user_message = f"""User instruction: "{user_instruction}"
+
+Files to organize ({len(files)} total):
+{file_summary}
+
+CRITICAL RULES:
+- FOLLOW the user's instruction for organizing these files
+- If user says "move all files to X", put ALL files in folder "X"
+- If user specifies a structure, follow it exactly
+- For any files NOT covered by the instruction, organize them logically by type or topic
+- You MUST include EVERY file_id in your response ({len(files)} total)
+- Every file_id must appear exactly once in your response
+- NEVER return empty folders
+
+Propose an organization plan. Return JSON only."""
+        else:
+            # No instruction provided - let AI decide the best organization
+            user_message = f"""Analyze these files and organize them in the SMARTEST way possible.
+
+Files to organize ({len(files)} total):
+{file_summary}
+
+ANALYZE THE FILES and choose the BEST organization approach:
+- If files seem related to different PROJECTS → organize by project name
+- If files seem related to different CLIENTS/PEOPLE → organize by client/person
+- If files seem related to different TOPICS/SUBJECTS → organize by topic
+- If files seem related to different EVENTS/DATES → organize by event
+- If files are just random mixed types → organize by file type (photos, videos, docs, etc.)
+
+CRITICAL RULES:
+- LOOK at the file names and tags to understand what they are about
+- Choose folder names that MAKE SENSE for these specific files
+- Use CLEAR, DESCRIPTIVE folder names (not generic like "folder1")
+- DO NOT put all files in a single folder - create a logical structure
+- You MUST include EVERY file_id in your response ({len(files)} total)
+- Each file_id must appear in exactly ONE folder
+- Create 2-5 folders depending on how the files naturally group
 
 Propose an organization plan. Return JSON only."""
 
     provider = settings.ai_provider
-    
+
     if provider == 'openai':
-        return _request_openai(user_message)
+        plan = _request_openai(user_message)
     elif provider == 'local':
-        return _request_ollama(user_message)
+        plan = _request_ollama(user_message)
     else:
         logger.warning("No AI provider configured")
         return None
+
+    # Deterministic tag-based safety net: rewrite any placement that violates
+    # an explicit user category→folder rule. No-op when the instruction has
+    # no extractable mapping, or when no file's tags match a user rule.
+    if plan:
+        try:
+            plan = _apply_tag_safety_net(
+                plan, files, user_instruction,
+                existing_folders_only=is_existing_folders_only,
+            )
+        except Exception as e:
+            logger.warning(f"[SafetyNet] Skipped due to error: {e}")
+
+    return plan
 
 
 def request_plan_refinement(
@@ -418,7 +714,12 @@ def deduplicate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     return {"folders": cleaned_folders}
 
 
-def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_info: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+def ensure_all_files_included(
+    plan: Dict[str, Any],
+    all_file_ids: set,
+    files_info: List[Dict[str, Any]] = None,
+    existing_folders_only: bool = False,
+) -> Dict[str, Any]:
     """
     Ensure all provided file IDs are included in the plan.
 
@@ -431,9 +732,16 @@ def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_inf
         plan: The organization plan from AI
         all_file_ids: Set of all file IDs that should be in the plan
         files_info: Optional list of file info dicts for better folder selection
+        existing_folders_only: When True (As-Is mode), do NOT fill omitted files
+            into best-guess existing folders. As-Is honours the AI's omission
+            as "leave the file in place." The worker reports the count to the
+            user. Without this, the per-file scoring inside this function
+            silently dumps every orphan into the highest-scoring existing
+            folder — exactly the failure mode the bears+lions bug surfaced.
 
     Returns:
-        Updated plan with all files included
+        Updated plan. In As-Is mode, omitted files stay omitted and the worker
+        leaves them in place on disk.
     """
     if not plan or "folders" not in plan:
         plan = {"folders": {}}
@@ -452,6 +760,16 @@ def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_inf
 
     if not missing_ids:
         return plan  # All files are included
+
+    if existing_folders_only:
+        # As-Is contract: never invent a destination. If the AI omitted these
+        # files we honour that — the worker leaves them on disk where they
+        # currently sit. Skip the force-placement logic below entirely.
+        logger.info(
+            f"[As-Is] AI plan omitted {len(missing_ids)} file(s); "
+            f"leaving them in place on disk"
+        )
+        return plan
 
     logger.warning(f"AI plan missing {len(missing_ids)} file(s). Adding them to existing folders.")
 

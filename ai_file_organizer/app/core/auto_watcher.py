@@ -86,17 +86,22 @@ class AutoWatcherWorker(QThread):
         """Pick the best existing folder to absorb files the AI assigned to a
         non-existing folder. Prefers a catch-all folder, otherwise the existing
         folder whose name is most similar to the AI's suggested name.
+
+        Note: in As-Is mode, the worker NO LONGER falls back to this method —
+        if the AI hallucinates a folder we'd rather leave the files in place
+        than force them into a wrong bucket (see the bears+lions bug at
+        2026-05-29 01:29 where every file got dumped into 'animals/Bears'
+        because difflib happened to score that highest against 'everything
+        else'). This method is retained for non-As-Is callers and tests.
         """
         import difflib
-        # Prefer a catch-all style folder if one exists
         catchall_keywords = ['everything', 'other', 'misc', 'general', 'rest', 'else']
         for f in self.existing_folders or []:
             if any(k in f.lower() for k in catchall_keywords):
                 return f
-        # Otherwise pick the most similar existing folder name
         ai_lower = ai_folder.lower().strip()
         if not self.existing_folders:
-            return ai_folder  # safety net; shouldn't reach here when called from As-Is mode
+            return ai_folder
         best_folder = self.existing_folders[0]
         best_score = 0.0
         for f in self.existing_folders:
@@ -116,7 +121,13 @@ class AutoWatcherWorker(QThread):
             return
         
         from app.core.database import file_index
-        from app.core.ai_organizer import request_organization_plan, validate_plan, deduplicate_plan, ensure_all_files_included
+        from app.core.ai_organizer import (
+            request_organization_plan,
+            validate_plan,
+            deduplicate_plan,
+            ensure_all_files_included,
+            _apply_tag_safety_net,
+        )
         from app.core.search import SearchService
         
         # First pass: identify files that need indexing
@@ -228,8 +239,24 @@ class AutoWatcherWorker(QThread):
                 file_size = os.path.getsize(file_path)
                 file_id = idx
                 
+                # First try the exact path. If the file was just moved (e.g. by
+                # flatten()) the DB might still hold its OLD path — fall back to
+                # filename lookup so we still recover its tags. Without this
+                # fallback, the AI-plan files_info ends up with empty tags after
+                # a flatten, and downstream consumers (the tag-based safety net
+                # in particular) silently see "no tags to match."
                 indexed_info = file_index.get_file_by_path(file_path)
-                
+                if not indexed_info:
+                    indexed_info = file_index.get_file_by_name(file_name)
+                    if indexed_info:
+                        # Reconcile the DB path so we don't keep hitting this
+                        # fallback every time.
+                        try:
+                            file_index.update_file_path(indexed_info['id'], file_path)
+                            indexed_info['file_path'] = file_path
+                        except Exception:
+                            pass
+
                 files_info.append({
                     'id': file_id,
                     'file_path': file_path,
@@ -257,22 +284,41 @@ class AutoWatcherWorker(QThread):
         
         try:
             plan = request_organization_plan(self.instruction, files_info)
-            
+
             if not plan:
                 logger.warning("[Worker] No plan returned from AI")
                 all_processed_files = list(self.file_paths)
                 self.finished_processing.emit(all_processed_files)
                 return
-            
+
+            # Belt-and-suspenders: run the deterministic tag-based safety net
+            # HERE in the worker as well. request_organization_plan already
+            # calls it, but the worker is the only auto-organize caller path
+            # so calling it explicitly here makes it impossible to bypass
+            # via any future change to that function. files_info is the exact
+            # dict list we built above (with tags) — no risk of shape mismatch.
+            try:
+                plan = _apply_tag_safety_net(
+                    plan,
+                    files_info,
+                    self.instruction,
+                    existing_folders_only=bool(self.existing_folders),
+                )
+            except Exception as e:
+                logger.warning(f"[Worker] Safety net skipped due to error: {e}")
+
             plan = deduplicate_plan(plan)
-            
-            # Safety net: route any file the AI omitted (not preserved) to the
-            # most relevant EXISTING folder via _best_folder_for_file (substring
-            # + difflib against folder names using each file's name/ext/label/
-            # category/tags, with catch-all preference when no strong subject
-            # match exists). Applies in BOTH modes — in As-Is the plan only
-            # contains existing folders so "most relevant" picks among those.
-            plan = ensure_all_files_included(plan, {f['id'] for f in files_info}, files_info)
+
+            # Fill in any files the AI omitted. In As-Is mode this is a
+            # no-op — see ensure_all_files_included docstring; omitted files
+            # are intentionally left in place rather than force-placed into
+            # a best-guess existing folder.
+            plan = ensure_all_files_included(
+                plan,
+                {f['id'] for f in files_info},
+                files_info,
+                existing_folders_only=bool(self.existing_folders),
+            )
             
             is_valid, errors = validate_plan(plan, {f['id'] for f in files_info})
             if not is_valid:
@@ -281,44 +327,62 @@ class AutoWatcherWorker(QThread):
                 self.finished_processing.emit(all_processed_files)
                 return
             
-            # Filter plan to only include files we're processing
-            # Also apply fuzzy matching for folder names when in "Organize As-Is" mode
+            # Filter plan to only include files we're processing.
+            # Also apply fuzzy matching for folder names in "Organize As-Is" mode.
             valid_file_ids = set(files_by_id.keys())
             filtered_folders = {}
-            # (Unmatched folders are no longer skipped; they're redirected via _best_existing_folder_for_name)
-            
+            left_in_place_ids: List[int] = []
+
             for folder_name, file_ids in plan.get('folders', {}).items():
                 valid_ids = [fid for fid in file_ids if fid in valid_file_ids]
                 if not valid_ids:
                     continue
-                
-                # Apply fuzzy matching when in "Organize As-Is" mode
+
                 if self.existing_folders:
+                    # As-Is mode. We pre-create folders the user explicitly
+                    # named in their instruction (see organize_single_folder
+                    # / organize_folders_with_per_folder_options), so the
+                    # allowed list already includes the user's intended
+                    # destinations. The AI is told (Mode A prompt) to use
+                    # ONLY those folders. If it still hallucinates a folder,
+                    # we DO NOT force-route into a wrong bucket — we leave
+                    # those files where they currently are on disk and tell
+                    # the user how many we skipped. The user can update
+                    # their instruction or pre-create the missing folder
+                    # and re-run.
                     matched_folder = self._fuzzy_match_folder(folder_name)
                     if matched_folder:
-                        # Map to existing folder
                         if matched_folder != folder_name:
                             logger.info(f"[Worker] Mapped AI folder '{folder_name}' -> existing '{matched_folder}'")
                         if matched_folder in filtered_folders:
                             filtered_folders[matched_folder].extend(valid_ids)
                         else:
-                            filtered_folders[matched_folder] = valid_ids
+                            filtered_folders[matched_folder] = list(valid_ids)
                     else:
-                        # No fuzzy match — redirect to the best existing folder
-                        # rather than leaving files loose. Prefer a catch-all
-                        # style folder; otherwise pick the existing folder
-                        # whose name is most similar to the AI's suggestion.
-                        fallback = self._best_existing_folder_for_name(folder_name)
-                        logger.info(f"[Worker] No match for '{folder_name}' - redirecting {len(valid_ids)} file(s) to '{fallback}'")
-                        if fallback in filtered_folders:
-                            filtered_folders[fallback].extend(valid_ids)
-                        else:
-                            filtered_folders[fallback] = list(valid_ids)
+                        # No fuzzy match against the user-permitted folder set.
+                        # Leave these files alone — do not invent a destination.
+                        logger.info(
+                            f"[Worker] As-Is: AI returned folder '{folder_name}' "
+                            f"which isn't user-permitted; leaving "
+                            f"{len(valid_ids)} file(s) in place"
+                        )
+                        left_in_place_ids.extend(valid_ids)
                 else:
-                    # Normal mode - use folder as-is
+                    # Reorganize-All / normal mode - use folder as-is
                     filtered_folders[folder_name] = valid_ids
-            
-            logger.info(f"[Worker] Filtered plan has {sum(len(ids) for ids in filtered_folders.values())} files in {len(filtered_folders)} folders")
+
+            placed_count = sum(len(ids) for ids in filtered_folders.values())
+            logger.info(
+                f"[Worker] Filtered plan has {placed_count} files in "
+                f"{len(filtered_folders)} folders"
+                + (f"; {len(left_in_place_ids)} file(s) left in place"
+                   if left_in_place_ids else "")
+            )
+            if left_in_place_ids:
+                self.status_changed.emit(
+                    f"As-Is: left {len(left_in_place_ids)} file(s) in place "
+                    f"(no matching folder)"
+                )
             
             # Execute moves
             moved_count = 0
@@ -690,7 +754,23 @@ class AutoOrganizeWatcher(QObject):
                 shutil.move(file_path, dest_path)
                 moved_count += 1
                 logger.info(f"Flattened: {file_path} -> {dest_path}")
-                
+
+                # Keep the DB in sync with disk. Without this the AI-plan
+                # build later in this same run can't find the file's tags
+                # via get_file_by_path (the path it knows is now stale),
+                # and downstream consumers — notably the tag-based safety
+                # net — silently see empty tags for every file. Lookup is
+                # by old path first, then by filename as a fallback.
+                try:
+                    from app.core.database import file_index
+                    rec = file_index.get_file_by_path(file_path)
+                    if not rec:
+                        rec = file_index.get_file_by_name(os.path.basename(file_path))
+                    if rec:
+                        file_index.update_file_path(rec['id'], dest_path)
+                except Exception as e:
+                    logger.debug(f"Flatten: could not update DB path for {file_path}: {e}")
+
             except Exception as e:
                 logger.error(f"Error flattening {file_path}: {e}")
                 self.error_occurred.emit(file_path, str(e))
@@ -735,26 +815,44 @@ class AutoOrganizeWatcher(QObject):
     def _ensure_named_folders_exist(self, folder_path: str, instruction: str) -> None:
         """Create folders the user named in their instruction if they don't exist.
 
-        Uses a case-insensitive check against current subfolders so existing
-        folders are never duplicated.
+        We collect the LEAF name of every existing subfolder (top-level AND
+        nested) — case-insensitive — so a user-named ``bears`` doesn't get
+        created at the root when ``animals/Bears`` already exists. In that
+        scenario the existing nested folder already fulfils the user's
+        intent; creating a parallel ``bears/`` at the root would split the
+        user's collection between two locations, which is the bug seen on
+        2026-05-29 02:05.
         """
         named = self._extract_named_folders(instruction)
         if not named:
             return
+
+        # Walk the tree (top-level + nested) and collect LEAF names so a
+        # user-named 'bears' matches an existing 'animals/Bears'.
+        existing_leaf_lower: set = set()
         try:
-            existing_lower = {
-                item.lower() for item in os.listdir(folder_path)
-                if os.path.isdir(os.path.join(folder_path, item))
-            }
+            for root, dirs, _ in os.walk(folder_path):
+                # Don't descend into hidden / build folders
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith('.') and d not in self._SKIP_DIR_NAMES
+                ]
+                for d in dirs:
+                    existing_leaf_lower.add(d.lower())
         except OSError:
-            existing_lower = set()
+            pass
+
         for name in named:
-            if name.lower() in existing_lower:
+            if name.lower() in existing_leaf_lower:
+                logger.info(
+                    f"User-specified folder '{name}' already exists as an "
+                    f"existing leaf — skipping creation"
+                )
                 continue
             try:
                 os.makedirs(os.path.join(folder_path, name), exist_ok=True)
                 logger.info(f"Created user-specified folder: {name}")
-                existing_lower.add(name.lower())
+                existing_leaf_lower.add(name.lower())
             except OSError as e:
                 logger.warning(f"Could not create folder '{name}': {e}")
 
@@ -1229,6 +1327,18 @@ class AutoOrganizeWatcher(QObject):
         
         for folder in folders_to_organize:  # Only for "Organize As-Is" folders
             folder = os.path.normpath(folder)
+            # Pre-create folders the user explicitly named in their instruction
+            # (e.g. "put everything else in a folder called everything else").
+            # Without this, As-Is mode tells the AI "ONLY use existing folders"
+            # but those user-named folders DON'T exist yet — the AI then
+            # proposes them anyway and the fuzzy-match fallback can dump
+            # files into the wrong place. Pre-creating closes that gap.
+            try:
+                instr = self._get_instruction_for_folder(folder) or ''
+                if instr:
+                    self._ensure_named_folders_exist(folder, instr)
+            except Exception as e:
+                logger.debug(f"As-Is: could not pre-create user-named folders for {folder}: {e}")
             existing_subfolders = self._collect_existing_folders(folder)
             existing_folders_by_parent[folder] = existing_subfolders
             logger.info(f"Organize As-Is for {folder}: existing folders = {existing_subfolders}")
@@ -1300,6 +1410,18 @@ class AutoOrganizeWatcher(QObject):
         # files directly into Photos/Vacation/ instead of just Photos/.
         existing_folders = []
         if not flatten_first:
+            # Pre-create folders the user explicitly named in their instruction
+            # so the AI sees them in the existing-folders list. Without this,
+            # As-Is tells the AI "ONLY use existing folders" but the user-named
+            # destinations (e.g. "everything else") don't exist yet — the AI
+            # then invents them anyway and the fuzzy-match fallback can dump
+            # files into the wrong place (the bug seen on 2026-05-29 01:29).
+            try:
+                instr = self.folder_instructions.get(folder_path, '') or ''
+                if instr:
+                    self._ensure_named_folders_exist(folder_path, instr)
+            except Exception as e:
+                logger.debug(f"As-Is: could not pre-create user-named folders for {folder_path}: {e}")
             existing_folders = self._collect_existing_folders(folder_path)
             logger.info(f"Organize As-Is mode: existing folders = {existing_folders}")
         
@@ -1335,16 +1457,35 @@ class AutoOrganizeWatcher(QObject):
         
         current_time = time.time()
         
-        # Periodic cleanup of empty folders
+        # Periodic cleanup of empty folders. Each watched folder's user
+        # instruction may explicitly name destinations (e.g. "in a folder
+        # called bears"). Those folders are PROTECTED from deletion even
+        # when empty — the user just told us they want them. Without this,
+        # an As-Is run can pre-create bears/tigers/everything-else, the AI
+        # might place 0 files in one of them (if no files of that subject
+        # exist this run), and the next cleanup tick would silently delete
+        # the folder the user asked for. Saw this at 2026-05-29 02:00:25.
         self._check_count += 1
         if self._check_count >= self._cleanup_interval:
             self._check_count = 0
             for folder in self.watched_folders:
                 folder = os.path.normpath(folder)
-                if os.path.isdir(folder):
-                    deleted = self._cleanup_empty_folders(folder)
-                    if deleted > 0:
-                        logger.info(f"Periodic cleanup: removed {deleted} empty folder(s)")
+                if not os.path.isdir(folder):
+                    continue
+                protected = set()
+                try:
+                    instr = self._get_instruction_for_folder(folder) or ''
+                    if instr:
+                        for n in self._extract_named_folders(instr):
+                            protected.add(n.lower())
+                except Exception as e:
+                    logger.debug(f"Periodic cleanup: could not derive protected names for {folder}: {e}")
+                deleted = self._cleanup_empty_folders(folder, protected_names=protected)
+                if deleted > 0:
+                    logger.info(
+                        f"Periodic cleanup: removed {deleted} empty folder(s) "
+                        f"(protected: {sorted(protected) if protected else 'none'})"
+                    )
         
         for folder in self.watched_folders:
             folder = os.path.normpath(folder)
@@ -1499,18 +1640,27 @@ class AutoOrganizeWatcher(QObject):
                 "EVERY file MUST be placed in a folder - NO files left out."
             )
         
-        # If a worker is already running, queue this request
-        # Store folder info instead of file paths - we'll re-scan when processing
+        # If a worker is already running, queue this request.
+        # Store BOTH the folder context AND the explicit file_paths the caller
+        # collected. On dequeue, if the queued file_paths are valid we use
+        # them directly — otherwise we fall back to re-scanning. Without the
+        # explicit paths, a user-initiated Reorganize-All / As-Is request
+        # that gets queued (because another folder's worker is running)
+        # would re-scan via _scan_folder_for_files, which filters against the
+        # start-time snapshot — and so finds "0 new files" and silently does
+        # nothing. That's the bug we hit at 2026-05-29 02:00 where the As-Is
+        # request queued behind the auto-organizing run and never executed.
         if self._current_worker is not None and self._current_worker.isRunning():
-            # Don't add duplicate entries for the same folder
             folder_normalized = os.path.normpath(folder)
             already_queued = any(
-                os.path.normpath(f) == folder_normalized 
-                for f, _, _ in self._worker_queue
+                os.path.normpath(item[0]) == folder_normalized
+                for item in self._worker_queue
             )
             if not already_queued:
                 logger.info(f"Worker busy, queuing folder {os.path.basename(folder)} for later processing")
-                self._worker_queue.append((folder, full_instruction, existing_folders))
+                self._worker_queue.append(
+                    (folder, full_instruction, existing_folders, list(file_paths))
+                )
             else:
                 logger.info(f"Folder {os.path.basename(folder)} already queued, skipping duplicate")
             return
@@ -1578,27 +1728,58 @@ class AutoOrganizeWatcher(QObject):
         
         # Process next item in queue if any
         if self._worker_queue:
-            folder, instruction, existing_folders = self._worker_queue.pop(0)
+            queued = self._worker_queue.pop(0)
+            # Backwards-compatible unpack — old queue entries were 3-tuples,
+            # new ones are 4-tuples with explicit file_paths.
+            if len(queued) >= 4:
+                folder, instruction, existing_folders, queued_paths = queued[:4]
+            else:
+                folder, instruction, existing_folders = queued
+                queued_paths = None
 
-            # RE-SCAN the folder to get fresh file paths (not stale ones from before)
-            # This also filters out files already in _organized_files, files
-            # captured by the start()-time snapshot, and Organize-New-Only
-            # leave-in-place paths.
-            file_paths = self._scan_folder_for_files(folder, exclude_organized=True)
-
-            # Organize-New-Only baseline + DB filter — same path the periodic
-            # scan uses. No-op for non-action-3 folders.
-            file_paths = self._filter_genuinely_new_files(folder, file_paths)
+            if queued_paths:
+                # User-initiated request (Reorganize-All / As-Is). Use the
+                # explicit paths the caller collected. Filter to ones still on
+                # disk in case another worker moved them.
+                #
+                # Deliberately do NOT filter by self._organized_files here:
+                # the user just clicked Save and wants EVERY file in this
+                # folder reprocessed against the latest instruction. Files
+                # processed in an earlier Save session are still in
+                # _organized_files (it's session-wide, not per-run), and
+                # dropping them now would silently skip them — exactly the
+                # bug seen on 2026-05-29 02:05 where the shutterstock bear
+                # file stayed put in animals/Bears because a previous Save
+                # had moved it once. The periodic-scan dequeue branch below
+                # still filters by _organized_files because that path is
+                # "detect changes since last tick" rather than user intent.
+                file_paths = [p for p in queued_paths if os.path.isfile(p)]
+                if file_paths:
+                    logger.info(
+                        f"Processing queued request: {len(file_paths)} "
+                        f"explicit file(s) in {os.path.basename(folder)}"
+                    )
+            else:
+                # Periodic / detection-driven request. Re-scan so we pick up
+                # files added since the queue entry was created.
+                file_paths = self._scan_folder_for_files(folder, exclude_organized=True)
+                # Organize-New-Only baseline + DB filter — same path the
+                # periodic scan uses. No-op for non-action-3 folders.
+                file_paths = self._filter_genuinely_new_files(folder, file_paths)
+                if file_paths:
+                    logger.info(
+                        f"Processing queued request: {len(file_paths)} "
+                        f"NEW files in {os.path.basename(folder)}"
+                    )
 
             if file_paths:
-                logger.info(f"Processing queued request: {len(file_paths)} NEW files in {os.path.basename(folder)}")
                 self._start_worker(file_paths, folder, instruction, existing_folders)
             else:
                 logger.info(f"Queued folder {folder} has no NEW files to process (all already organized)")
                 # Clear remaining queue for same folder to prevent loops
                 self._worker_queue = [
-                    (f, i, e) for f, i, e in self._worker_queue 
-                    if os.path.normpath(f) != os.path.normpath(folder)
+                    item for item in self._worker_queue
+                    if os.path.normpath(item[0]) != os.path.normpath(folder)
                 ]
                 # Process next in queue if any remain
                 if self._worker_queue:
