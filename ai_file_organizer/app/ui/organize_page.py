@@ -6002,7 +6002,13 @@ class OrganizePage(QWidget):
         if self.auto_watcher and self.auto_watcher.is_running:
             self._stop_watch_mode()
             self._was_manually_stopped = True  # Track that user manually stopped
+            # Persist the paused state so closing the app / switching tabs / dialog
+            # Saves don't quietly resume auto-organize behind the user's back.
+            settings.set_auto_organize_paused(True)
         else:
+            # User explicitly clicked Start — clear the paused flag so future
+            # auto-start checks honor it.
+            settings.set_auto_organize_paused(False)
             # If resuming after manual stop, skip the popup (just restart watching)
             skip_popup = getattr(self, '_was_manually_stopped', False)
             self._start_watch_mode(skip_existing_popup=skip_popup)
@@ -6118,6 +6124,12 @@ class OrganizePage(QWidget):
     
     def _check_auto_start(self):
         """Check if we should auto-start the watcher on app open."""
+        # Respect the user's explicit Stop. If they paused the watcher, leave it
+        # paused — across app restarts, tab switches, and dialog Saves. They have
+        # to click Start to resume.
+        if settings.auto_organize_paused:
+            logger.info("Auto-start skipped: watcher is paused (user previously clicked Stop)")
+            return
         # Auto-start if there are configured folders (no toggle needed)
         if not settings.auto_organize_folders:
             return

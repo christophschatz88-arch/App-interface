@@ -81,7 +81,31 @@ class AutoWatcherWorker(QThread):
         
         # No good match found
         return None
-    
+
+    def _best_existing_folder_for_name(self, ai_folder: str) -> str:
+        """Pick the best existing folder to absorb files the AI assigned to a
+        non-existing folder. Prefers a catch-all folder, otherwise the existing
+        folder whose name is most similar to the AI's suggested name.
+        """
+        import difflib
+        # Prefer a catch-all style folder if one exists
+        catchall_keywords = ['everything', 'other', 'misc', 'general', 'rest', 'else']
+        for f in self.existing_folders or []:
+            if any(k in f.lower() for k in catchall_keywords):
+                return f
+        # Otherwise pick the most similar existing folder name
+        ai_lower = ai_folder.lower().strip()
+        if not self.existing_folders:
+            return ai_folder  # safety net; shouldn't reach here when called from As-Is mode
+        best_folder = self.existing_folders[0]
+        best_score = 0.0
+        for f in self.existing_folders:
+            score = difflib.SequenceMatcher(None, ai_lower, f.lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best_folder = f
+        return best_folder
+
     def run(self):
         """Process files in background thread."""
         # Track all files we process (for marking as organized)
@@ -242,10 +266,13 @@ class AutoWatcherWorker(QThread):
             
             plan = deduplicate_plan(plan)
             
-            # In "Organize As-Is" mode, DON'T add missing files to 'misc'
-            # Instead, leave them where they are
-            if not self.existing_folders:
-                plan = ensure_all_files_included(plan, {f['id'] for f in files_info})
+            # Safety net: route any file the AI omitted (not preserved) to the
+            # most relevant EXISTING folder via _best_folder_for_file (substring
+            # + difflib against folder names using each file's name/ext/label/
+            # category/tags, with catch-all preference when no strong subject
+            # match exists). Applies in BOTH modes — in As-Is the plan only
+            # contains existing folders so "most relevant" picks among those.
+            plan = ensure_all_files_included(plan, {f['id'] for f in files_info}, files_info)
             
             is_valid, errors = validate_plan(plan, {f['id'] for f in files_info})
             if not is_valid:
@@ -258,7 +285,7 @@ class AutoWatcherWorker(QThread):
             # Also apply fuzzy matching for folder names when in "Organize As-Is" mode
             valid_file_ids = set(files_by_id.keys())
             filtered_folders = {}
-            skipped_folders = []  # Folders that didn't match any existing folder
+            # (Unmatched folders are no longer skipped; they're redirected via _best_existing_folder_for_name)
             
             for folder_name, file_ids in plan.get('folders', {}).items():
                 valid_ids = [fid for fid in file_ids if fid in valid_file_ids]
@@ -277,15 +304,19 @@ class AutoWatcherWorker(QThread):
                         else:
                             filtered_folders[matched_folder] = valid_ids
                     else:
-                        # No match - don't create new folder, skip these files
-                        skipped_folders.append(folder_name)
-                        logger.info(f"[Worker] Skipping folder '{folder_name}' - not in existing folders, files will stay in place")
+                        # No fuzzy match — redirect to the best existing folder
+                        # rather than leaving files loose. Prefer a catch-all
+                        # style folder; otherwise pick the existing folder
+                        # whose name is most similar to the AI's suggestion.
+                        fallback = self._best_existing_folder_for_name(folder_name)
+                        logger.info(f"[Worker] No match for '{folder_name}' - redirecting {len(valid_ids)} file(s) to '{fallback}'")
+                        if fallback in filtered_folders:
+                            filtered_folders[fallback].extend(valid_ids)
+                        else:
+                            filtered_folders[fallback] = list(valid_ids)
                 else:
                     # Normal mode - use folder as-is
                     filtered_folders[folder_name] = valid_ids
-            
-            if skipped_folders:
-                logger.info(f"[Worker] Skipped {len(skipped_folders)} non-existing folders: {skipped_folders}")
             
             logger.info(f"[Worker] Filtered plan has {sum(len(ids) for ids in filtered_folders.values())} files in {len(filtered_folders)} folders")
             
@@ -801,15 +832,75 @@ class AutoOrganizeWatcher(QObject):
         logger.debug(f"Instruction (cache) for {folder_path}: {instruction[:50] if instruction else '(none)'}")
         return instruction
 
+    # Folder names that look like build/system scaffolding rather than user
+    # destinations; filtered out of the existing-folders list for As-Is mode.
+    _SKIP_DIR_NAMES = {
+        '__pycache__', 'node_modules', 'venv', '.venv',
+        'dist', 'build', '.cache', '.next', '.nuxt',
+    }
+
+    def _collect_existing_folders(self, folder_path: str,
+                                  max_depth: int = 3,
+                                  max_total: int = 200) -> List[str]:
+        """Collect existing subfolders inside ``folder_path`` for As-Is mode.
+
+        Walks up to ``max_depth`` levels deep so nested folders like
+        'Photos/Vacation' are also valid destinations — not just the immediate
+        children. Hidden folders ('.git', '.idea', …) and obvious build
+        artifacts are skipped. Returns paths RELATIVE to ``folder_path``,
+        using forward slashes for stable consumption by the AI prompt.
+
+        If the total exceeds ``max_total``, falls back to top-level only —
+        deep listings produce noisy AI plans and the user is likely using
+        nested folders as scaffolding, not destinations.
+        """
+        folder_path = os.path.normpath(folder_path)
+        if not os.path.isdir(folder_path):
+            return []
+        out: List[str] = []
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                rel = os.path.relpath(root, folder_path)
+                depth = 0 if rel == '.' else rel.count(os.sep) + 1
+                # Children of this root are at depth+1. Stop descending past the cap.
+                if depth + 1 > max_depth:
+                    dirs[:] = []
+                    continue
+                # Prune hidden + known system/scaffolding folders in-place so we
+                # neither include them nor descend into them.
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith('.') and d not in self._SKIP_DIR_NAMES
+                ]
+                for d in dirs:
+                    sub_rel = os.path.relpath(os.path.join(root, d), folder_path)
+                    out.append(sub_rel.replace(os.sep, '/'))
+        except OSError as e:
+            logger.warning(f"Could not walk {folder_path} for existing folders: {e}")
+            return []
+
+        if len(out) > max_total:
+            logger.info(
+                f"Existing-folders walk found {len(out)} folders (cap {max_total}); "
+                "falling back to top-level only."
+            )
+            out = []
+            try:
+                for item in os.listdir(folder_path):
+                    if item.startswith('.') or item in self._SKIP_DIR_NAMES:
+                        continue
+                    if os.path.isdir(os.path.join(folder_path, item)):
+                        out.append(item)
+            except OSError:
+                pass
+        return out
+
     def _get_existing_folders_if_as_is(self, folder_path: str) -> list:
-        """Return existing subfolders if folder is in ORGANIZE_AS_IS mode, else None."""
+        """Return existing subfolders (nested too) if folder is in ORGANIZE_AS_IS mode, else None."""
         from app.core.settings import settings
         ORGANIZE_AS_IS = 2
         if settings.get_auto_organize_action(folder_path) == ORGANIZE_AS_IS:
-            return [
-                item for item in os.listdir(folder_path)
-                if os.path.isdir(os.path.join(folder_path, item)) and not item.startswith('.')
-            ]
+            return self._collect_existing_folders(folder_path)
         return None
     
     def _organize_existing_files(self) -> None:
@@ -937,11 +1028,7 @@ class AutoOrganizeWatcher(QObject):
         
         for folder in folders_to_organize:  # Only for "Organize As-Is" folders
             folder = os.path.normpath(folder)
-            existing_subfolders = []
-            for item in os.listdir(folder):
-                item_path = os.path.join(folder, item)
-                if os.path.isdir(item_path) and not item.startswith('.'):
-                    existing_subfolders.append(item)
+            existing_subfolders = self._collect_existing_folders(folder)
             existing_folders_by_parent[folder] = existing_subfolders
             logger.info(f"Organize As-Is for {folder}: existing folders = {existing_subfolders}")
         
@@ -1007,14 +1094,12 @@ class AutoOrganizeWatcher(QObject):
             if count > 0:
                 self.status_changed.emit(f"Flattened {count} files, now organizing...")
         
-        # Step 2: Get existing folder structure (for "Organize As-Is" mode)
+        # Step 2: Get existing folder structure (for "Organize As-Is" mode).
+        # Includes nested subfolders (up to a sensible depth) so the AI can route
+        # files directly into Photos/Vacation/ instead of just Photos/.
         existing_folders = []
         if not flatten_first:
-            # Collect existing subfolders - AI should only use these
-            for item in os.listdir(folder_path):
-                item_path = os.path.join(folder_path, item)
-                if os.path.isdir(item_path) and not item.startswith('.'):
-                    existing_folders.append(item)
+            existing_folders = self._collect_existing_folders(folder_path)
             logger.info(f"Organize As-Is mode: existing folders = {existing_folders}")
         
         # Step 3: Collect files from this folder
@@ -1129,12 +1214,48 @@ class AutoOrganizeWatcher(QObject):
                 f"[AUTO-ORGANIZE - EXISTING FOLDERS ONLY]\n"
                 f"User's instructions: {instruction if instruction else 'Organize files into appropriate folders'}\n\n"
                 f"EXISTING FOLDERS YOU CAN USE: {folders_list}\n\n"
-                "CRITICAL RULES:\n"
-                "1. You can ONLY use the folders listed above - DO NOT create any new folders\n"
-                "2. Move EVERY file to the most appropriate EXISTING folder based on file type/content\n"
-                "3. EVERY file MUST be included in your plan - put each file in the closest matching folder\n"
-                "4. Do NOT leave any files out - use your best judgment for the closest match\n"
-                "5. EVERY file_id in your response MUST go to one of the existing folders listed above"
+                "GROUND RULES:\n"
+                "• You can ONLY use the folders listed above — never create new folders.\n"
+                "• Folder names use forward slashes for nested paths ('Photos/Vacation' = Vacation inside Photos).\n"
+                "• When both a parent and a nested folder apply, PREFER the most-specific nested one (a vacation photo "
+                "goes to 'Photos/Vacation', not just 'Photos').\n"
+                "• Every file_id MUST appear exactly once in your plan. Omitting a file is FORBIDDEN.\n\n"
+                "DECISION TREE — for EACH file, follow these steps IN ORDER:\n\n"
+                "  Step 1: Compare the file's TAGS to the LEAF NAME of each existing folder. The LEAF NAME is the "
+                "LAST segment after any slashes — for 'everything-else/pigs' the leaf is 'pigs' (not 'everything-else'). "
+                "Does any tag (or its singular/plural form) match a leaf name? Tag 'pig' matches leaf 'pigs'; tag 'lion' "
+                "matches leaf 'lions'; tag 'vacation' matches leaf 'Vacation'.\n"
+                "    → YES: place the file in that folder. If MULTIPLE folders share a matching leaf (e.g. both 'pigs' "
+                "and 'everything-else/pigs' would match a pig file), pick the most-specific (nested) one.\n"
+                "    → NO: go to Step 2.\n\n"
+                "  Step 2: Is there a CATCH-ALL folder among the existing folders? (A catch-all is one whose LEAF NAME "
+                "contains 'other', 'everything', 'misc', 'general', 'rest', 'else', 'various', or 'unsorted'.)\n"
+                "    → YES: place the file in that catch-all folder. STOP HERE. Do NOT put it in a subject folder it "
+                "doesn't actually belong to just because that folder vaguely exists.\n"
+                "    → NO: go to Step 3.\n\n"
+                "  Step 3: No catch-all available — pick the existing folder whose name is most similar to the file's "
+                "content type, using your best judgment.\n\n"
+                "WORKED EXAMPLES:\n\n"
+                "Folders = ['lions', 'everything-else', 'everything-else/pigs']  (NOTE: 'pigs' is NESTED inside "
+                "everything-else):\n"
+                "  • Lion photo  (tag 'lion') → 'lions'                  [Step 1: tag matches leaf 'lions']\n"
+                "  • Pig photo   (tag 'pig')  → 'everything-else/pigs'   [Step 1: tag 'pig' matches LEAF 'pigs' of the "
+                "nested folder — use the nested folder, NOT the parent 'everything-else']\n"
+                "  • Bear photo  (tag 'bear') → 'everything-else'        [Step 2: no bear folder anywhere; catch-all]\n"
+                "  • Sunset photo (no clear subject) → 'everything-else' [Step 2: catch-all]\n\n"
+                "Folders = ['Photos', 'Photos/Vacation', 'Docs']:\n"
+                "  • Vacation photo (tags 'photo','vacation') → 'Photos/Vacation'  [Step 1: 'vacation' matches the "
+                "leaf of the nested folder; prefer nested over the parent 'Photos']\n"
+                "  • Regular photo (tag 'photo' only) → 'Photos'  [Step 1: 'photo' matches leaf 'Photos'; nested "
+                "'Photos/Vacation' does not apply because the file has no vacation tag]\n"
+                "  • PDF document → 'Docs'  [Step 1: 'document' matches leaf 'Docs']\n\n"
+                "FORBIDDEN:\n"
+                "  • Putting a PIG photo in 'everything-else' when 'everything-else/pigs' exists. The nested 'pigs' "
+                "folder is the correct destination for pig files — don't dump them in the parent.\n"
+                "  • Putting a BEAR photo in 'lions' or 'pigs' just because they're animal-themed — they are not bear "
+                "folders. Bears with no bear-named folder go to the catch-all.\n"
+                "  • Omitting any file from your response (every file_id must appear exactly once).\n"
+                "  • Creating a folder not in the listed existing folders."
             )
             logger.info(f"[Worker] Organize As-Is mode: restricting to folders: {existing_folders}")
         elif instruction:

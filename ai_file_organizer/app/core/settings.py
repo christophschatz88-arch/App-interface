@@ -56,6 +56,10 @@ class Settings:
         self.auto_organize_folders: List[Dict[str, str]] = []
         # Auto-start watcher when app opens (default True)
         self.auto_organize_auto_start: bool = True
+        # User explicitly stopped the watcher and we should NOT auto-start it
+        # back up — across tab switches, dialog Saves, or app restarts.
+        # Cleared again when the user clicks Start.
+        self.auto_organize_paused: bool = False
         # Last active timestamp (ISO format) for catch-up feature
         self.auto_organize_last_active: str = ''
         
@@ -310,6 +314,7 @@ class Settings:
         if isinstance(auto_folders, list):
             self.auto_organize_folders = auto_folders
         self.auto_organize_auto_start = bool(data.get('auto_organize_auto_start', True))
+        self.auto_organize_paused = bool(data.get('auto_organize_paused', False))
         self.auto_organize_last_active = data.get('auto_organize_last_active', '')
         
         # Exclusion patterns
@@ -354,6 +359,7 @@ class Settings:
             # Auto-organize watcher settings
             'auto_organize_folders': self.auto_organize_folders,
             'auto_organize_auto_start': self.auto_organize_auto_start,
+            'auto_organize_paused': self.auto_organize_paused,
             'auto_organize_last_active': self.auto_organize_last_active,
             # Exclusion patterns
             'exclusion_patterns': self.exclusion_patterns,
@@ -512,6 +518,13 @@ class Settings:
             if folder.get('path') == folder_path:
                 return folder.get('action', 3)  # Default to Watch Only
         return 3
+
+    def set_auto_organize_paused(self, paused: bool) -> None:
+        """Mark the watcher as user-paused (or un-pause it). Persisted across
+        tab switches, dialog saves, and app restarts.
+        """
+        self.auto_organize_paused = bool(paused)
+        self._save_config()
 
     def set_auto_organize_auto_start(self, enabled: bool) -> None:
         """Enable or disable auto-start of watcher on app open."""

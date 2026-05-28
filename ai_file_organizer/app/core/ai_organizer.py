@@ -184,8 +184,25 @@ def request_organization_plan(
     
     # Detect auto-organize mode vs specific instruction mode
     is_auto_organize = user_instruction.startswith("[AUTO-ORGANIZE]")
-    
-    if is_auto_organize:
+    is_existing_folders_only = "EXISTING FOLDERS ONLY" in user_instruction
+
+    if is_auto_organize and is_existing_folders_only:
+        # MODE A — ORGANIZE AS-IS: the AI MUST use only the folders already
+        # passed in the instruction. No new folders, no misc, no catch-all.
+        user_message = f"""User instruction: "{user_instruction}"
+
+Files to organize ({len(files)} total):
+{file_summary}
+
+CRITICAL - EXISTING FOLDERS ONLY:
+- You can ONLY use the folders listed in the instruction - DO NOT create new folders
+- Put each file in the MOST APPROPRIATE existing folder based on file type/content
+- You MUST include EVERY file_id in your response ({len(files)} total)
+- Each file_id must appear in exactly ONE folder
+- Use your best judgment to match files to the closest existing folder
+
+Propose an organization plan. Return JSON only."""
+    elif is_auto_organize:
         # Auto-organize: MUST include ALL files
         user_message = f"""User instruction: "{user_instruction}"
 
@@ -481,10 +498,18 @@ def ensure_all_files_included(plan: Dict[str, Any], all_file_ids: set, files_inf
 def _best_folder_for_file(file_info: Optional[Dict[str, Any]], folder_names: List[str]) -> str:
     """Pick the existing folder whose name best matches a file's metadata.
 
-    Scores each folder name against the file's name, extension, label,
-    category, and tags using substring matches plus difflib.SequenceMatcher
-    similarity. Falls back to the first folder when no signal is available,
-    and to 'misc' when there are no folders at all.
+    Scoring strategy:
+    1. Tags / filename / label tokens that overlap a folder name (substring
+       either way) score 1.0 — the strongest signal.
+    2. Otherwise use difflib similarity.
+    3. If the best non-catch-all match is weak (no strong substring hit), and
+       a catch-all-style folder exists (name contains 'everything', 'other',
+       'misc', 'general', 'rest', 'else'), prefer the catch-all. This
+       prevents a bear photo from being shoved into 'lions' just because of
+       random character overlap when an 'everything-else' folder is sitting
+       right there for exactly this case.
+    4. Falls back to the first folder when no signal is available, and to
+       'misc' when there are no folders at all.
     """
     if not folder_names:
         return 'misc'
@@ -492,6 +517,16 @@ def _best_folder_for_file(file_info: Optional[Dict[str, Any]], folder_names: Lis
         return folder_names[0]
 
     import difflib
+
+    catchall_keywords = {'everything', 'other', 'misc', 'general', 'rest', 'else', 'miscellaneous', 'various', 'unsorted'}
+
+    def _is_catchall(folder: str) -> bool:
+        # Only the leaf folder name counts — 'everything-else/pigs' is NOT a
+        # catch-all (the LEAF is 'pigs'), even though its parent name contains
+        # 'else'. We use forward slash because the helper that builds nested
+        # folder lists also uses forward slashes.
+        leaf = folder.rsplit('/', 1)[-1].lower()
+        return any(k in leaf for k in catchall_keywords)
 
     # Build descriptive terms for the file from its metadata
     terms = []
@@ -512,17 +547,33 @@ def _best_folder_for_file(file_info: Optional[Dict[str, Any]], folder_names: Lis
 
     best_folder = folder_names[0]
     best_score = 0.0
+    had_strong_hit = False
     for folder in folder_names:
         folder_lc = folder.lower()
+        # Don't let a catch-all folder win on fuzzy similarity alone — only via
+        # an actual substring hit. Otherwise short generic names ("Other")
+        # would be picked accidentally.
+        if _is_catchall(folder):
+            continue
         score = 0.0
         for term in terms:
-            if term in folder_lc or folder_lc in term:
+            if term and (term in folder_lc or folder_lc in term):
                 score = max(score, 1.0)
             else:
                 score = max(score, difflib.SequenceMatcher(None, term, folder_lc).ratio())
+        if score >= 0.85:
+            had_strong_hit = True
         if score > best_score:
             best_score = score
             best_folder = folder
+
+    # If no real signal pointed at a specific folder, prefer a catch-all if one
+    # exists — that's the whole point of the catch-all folder.
+    if not had_strong_hit:
+        for folder in folder_names:
+            if _is_catchall(folder):
+                return folder
+
     return best_folder
 
 
