@@ -1038,33 +1038,47 @@ class AutoOrganizeWatcher(QObject):
                 except Exception:
                     known = None
 
-            if is_baseline or known is not None:
-                # Pre-existing file (covered by baseline or already in DB).
-                np = os.path.normpath(path)
-                if known is not None:
-                    stored = known.get('file_path') or ''
-                    if stored and os.path.normpath(stored) != np:
-                        try:
-                            file_index.update_file_path(known['id'], np)
-                        except Exception as e:
-                            logger.warning(f"[OrganizeNewOnly] Could not update DB path: {e}")
-                        logger.info(
-                            f"[OrganizeNewOnly] '{os.path.basename(path)}' already known (moved) - leaving in place"
-                        )
-                    else:
-                        logger.info(
-                            f"[OrganizeNewOnly] '{os.path.basename(path)}' already known - leaving in place"
-                        )
-                else:
-                    logger.info(
-                        f"[OrganizeNewOnly] '{os.path.basename(path)}' pre-existing (baseline) - leaving in place"
-                    )
-                # Loop-suppression: never touch this file again this session.
+            np = os.path.normpath(path)
+            # Baseline match → pre-existing file. Leave in place.
+            if is_baseline:
+                logger.info(
+                    f"[OrganizeNewOnly] '{os.path.basename(path)}' pre-existing (baseline) - leaving in place"
+                )
                 self._left_in_place_paths.add(np.lower())
                 self._processed_files.add(np)
                 self._organized_files.add(np)
-            else:
-                kept.append(path)
+                continue
+
+            # DB match. Only treat as pre-existing if the stored path is
+            # DIFFERENT from the candidate path — that signals the user
+            # moved/renamed a previously-indexed file into the watched
+            # folder, which is the case we want to honor (rename detection).
+            #
+            # If the stored path EQUALS the candidate path, that's almost
+            # always a race condition: the watcher just auto-indexed this
+            # very file moments ago and the periodic scan came back around
+            # to check it. Suppressing it here would lock a genuinely-new
+            # file in place forever (seen in the 22:52:02 log for
+            # animal-hero-tiger_0.jpg). Treat as new in that case so the
+            # AI plan can still route it.
+            if known is not None:
+                stored = known.get('file_path') or ''
+                if stored and os.path.normpath(stored) != np:
+                    try:
+                        file_index.update_file_path(known['id'], np)
+                    except Exception as e:
+                        logger.warning(f"[OrganizeNewOnly] Could not update DB path: {e}")
+                    logger.info(
+                        f"[OrganizeNewOnly] '{os.path.basename(path)}' already known (moved) - leaving in place"
+                    )
+                    self._left_in_place_paths.add(np.lower())
+                    self._processed_files.add(np)
+                    self._organized_files.add(np)
+                    continue
+                # stored == np → same path → just-indexed by this watcher.
+                # Fall through to keep this file as a new candidate.
+
+            kept.append(path)
         return kept
 
     def _get_existing_folders_if_as_is(self, folder_path: str) -> list:
@@ -1565,11 +1579,17 @@ class AutoOrganizeWatcher(QObject):
         # Process next item in queue if any
         if self._worker_queue:
             folder, instruction, existing_folders = self._worker_queue.pop(0)
-            
+
             # RE-SCAN the folder to get fresh file paths (not stale ones from before)
-            # This also filters out files already in _organized_files
+            # This also filters out files already in _organized_files, files
+            # captured by the start()-time snapshot, and Organize-New-Only
+            # leave-in-place paths.
             file_paths = self._scan_folder_for_files(folder, exclude_organized=True)
-            
+
+            # Organize-New-Only baseline + DB filter — same path the periodic
+            # scan uses. No-op for non-action-3 folders.
+            file_paths = self._filter_genuinely_new_files(folder, file_paths)
+
             if file_paths:
                 logger.info(f"Processing queued request: {len(file_paths)} NEW files in {os.path.basename(folder)}")
                 self._start_worker(file_paths, folder, instruction, existing_folders)
@@ -1593,34 +1613,53 @@ class AutoOrganizeWatcher(QObject):
         """
         Scan a folder and return list of file paths.
         Used when processing queued requests to get fresh file paths.
-        
+
         Args:
             folder: The folder to scan
             exclude_organized: If True, exclude files already in _organized_files
+
+        IMPORTANT: This is the queue-dequeue path. It MUST apply the same
+        "not new" filters as the periodic scan in ``_check_for_new_files``,
+        otherwise pre-existing files in subfolders (captured by the
+        start()-time ``_processed_files`` snapshot, or marked
+        leave-in-place by Organize New Only) get re-walked here and end up
+        in the next worker batch. That manifests as "the watcher organized
+        files that were already sitting in subfolders before I clicked
+        Start" — exactly the v12.2.2 regression seen in the log at
+        22:40:54 where everything-else/* and tiggers/regal-bengal-tiger
+        were reorganized despite being in the baseline.
         """
         folder = os.path.normpath(folder)
         file_paths = []
-        
+
         if not os.path.isdir(folder):
             return file_paths
-        
+
         for root, dirs, files in os.walk(folder):
             # Skip hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
+
             for item in files:
                 if self._should_ignore(item):
                     continue
                 item_path = os.path.join(root, item)
-                
-                # Skip files that have already been organized (prevents loops)
-                if exclude_organized:
-                    normalized_path = os.path.normpath(item_path)
-                    if normalized_path in self._organized_files:
-                        continue
-                
+                normalized_path = os.path.normpath(item_path)
+
+                # Files captured by the start()-time snapshot were there
+                # before watching began; never let them through the queue
+                # path either.
+                if normalized_path in self._processed_files:
+                    continue
+                # Organize-New-Only loop suppression: once a file has been
+                # declared "leave in place" this session, skip it here too.
+                if normalized_path.lower() in self._left_in_place_paths:
+                    continue
+                # Skip files that have already been organized (prevents loops).
+                if exclude_organized and normalized_path in self._organized_files:
+                    continue
+
                 file_paths.append(item_path)
-        
+
         return file_paths
     
     def _execute_plan(self, plan: Dict, files_by_id: Dict, dest_folder: str) -> None:
