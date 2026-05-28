@@ -693,7 +693,16 @@ def gpt_vision_fallback(image_b64: str, filename: Optional[str] = None, user_ins
         if filename:
             user_content.append({"type": "text", "text": f"filename: {filename}"})
         user_content.append({"type": "text", "text": "Return STRICT JSON only using the schema."})
-        user_content.append({"type": "image_url", "image_url": {"url": data_url}})
+        # detail:"high" sends ~1445 image tokens to the model instead of the
+        # default ~765 (~2x input cost). On gpt-4o-mini specifically this is
+        # the cheapest knob that meaningfully reduces look-alike misclass-
+        # ifications — caught a tiger being labelled 'bear' on 2026-05-29
+        # 02:12 because the model only had a low-detail thumbnail to work
+        # with. Cost stays well under a cent per image.
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": data_url, "detail": "high"},
+        })
 
         resp_data = _call_openai_proxy(
             "vision",
