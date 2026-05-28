@@ -6009,10 +6009,22 @@ class OrganizePage(QWidget):
             # User explicitly clicked Start — clear the paused flag so future
             # auto-start checks honor it.
             settings.set_auto_organize_paused(False)
+
+            # OPTIMISTIC UI UPDATE: disable the button and show a transient
+            # "Starting…" label the instant the click is registered. The
+            # actual start path (which can take a moment for Organize-New-Only
+            # folders since it hashes every pre-existing file for the
+            # baseline) is then deferred via QTimer.singleShot(0, …) so the
+            # button visibly reacts before any blocking work begins.
+            self.watch_toggle_btn.setEnabled(False)
+            self.watch_toggle_btn.setText("⏳ Starting…")
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+
             # If resuming after manual stop, skip the popup (just restart watching)
             skip_popup = getattr(self, '_was_manually_stopped', False)
-            self._start_watch_mode(skip_existing_popup=skip_popup)
             self._was_manually_stopped = False  # Reset flag after starting
+            QTimer.singleShot(0, lambda: self._start_watch_mode(skip_existing_popup=skip_popup))
     
     def _start_watch_mode(self, is_catch_up: bool = False, catch_up_since=None, skip_existing_popup: bool = False):
         """Start watching folders for new files.
@@ -6027,8 +6039,11 @@ class OrganizePage(QWidget):
                 self, "No Folders",
                 "Please configure folders to watch first."
             )
+            # Restore the toggle button so the user can try again.
+            self.watch_toggle_btn.setEnabled(True)
+            self._update_watch_summary()
             return
-        
+
         # Clear and setup watcher
         self.auto_watcher.clear_folders()
         self.watch_folders.clear()
@@ -6061,8 +6076,11 @@ class OrganizePage(QWidget):
                 self, "No Valid Folders",
                 "None of the configured folders exist. Please reconfigure."
             )
+            # Restore the toggle button so the user can try again.
+            self.watch_toggle_btn.setEnabled(True)
+            self._update_watch_summary()
             return
-        
+
         # Set folder instructions
         self.auto_watcher.folder_instructions = folder_instructions
         
@@ -6108,8 +6126,21 @@ class OrganizePage(QWidget):
         organize_existing = bool(is_catch_up)
 
         # Start the watcher (periodic timer; per-folder organize already
-        # happened via Save when the user picked their action).
-        self.auto_watcher.start(organize_existing=organize_existing, flatten_first=False)
+        # happened via Save when the user picked their action). Defer the
+        # actual start() call one more event-loop tick so the "⏳ Starting…"
+        # label set in _toggle_watch_mode has a chance to paint — start()
+        # itself can take a moment for Organize-New-Only folders since it
+        # hashes every pre-existing file to build the baseline.
+        def _finish_start():
+            try:
+                self.auto_watcher.start(organize_existing=organize_existing, flatten_first=False)
+            finally:
+                # Re-enable the button only after the worker is actually
+                # watching, regardless of whether start() succeeded. The
+                # button is in the "Stop" visual state already (set in
+                # _update_watch_summary_as_watching above).
+                self.watch_toggle_btn.setEnabled(True)
+        QTimer.singleShot(0, _finish_start)
         
     def _stop_watch_mode(self):
         """Stop watching folders."""

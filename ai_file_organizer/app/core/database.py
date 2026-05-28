@@ -813,6 +813,37 @@ class FileIndex:
             logger.error(f"Error getting file by name {file_name}: {e}")
             return None
 
+    def get_file_by_hash(self, content_hash: str) -> Optional[Dict[str, Any]]:
+        """Look up a file by its SHA-256 content hash.
+
+        Returns the first match (there can be duplicates if the same content
+        exists at multiple paths). Used by the Organize-New-Only watcher to
+        recognize a moved/renamed/copied pre-existing file by its bytes
+        instead of by its path.
+        """
+        if not content_hash:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, file_path, file_name, content_hash FROM files WHERE content_hash = ? LIMIT 1",
+                    (content_hash,)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'id': row['id'],
+                    'file_path': row['file_path'],
+                    'file_name': row['file_name'],
+                    'content_hash': row['content_hash'],
+                }
+        except Exception as e:
+            logger.error(f"Error fetching file by hash: {e}")
+            return None
+
     def get_file_by_path(self, file_path: str) -> Optional[Dict[str, Any]]:
         """
         Get file information by path.
