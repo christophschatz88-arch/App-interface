@@ -8,13 +8,13 @@ from typing import List, Dict, Any
 from datetime import datetime
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem,
     QFileDialog, QMessageBox, QProgressBar, QStatusBar,
     QHeaderView, QGroupBox, QTextEdit, QSplitter, QTabWidget,
     QLineEdit, QCompleter, QListWidget, QListWidgetItem, QComboBox,
     QApplication, QCheckBox, QProgressDialog, QInputDialog, QFrame,
-    QSizePolicy, QStackedWidget, QButtonGroup, QScrollArea
+    QSizePolicy, QStackedWidget, QButtonGroup, QScrollArea, QDialog
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
 from PySide6.QtGui import QFont, QIcon, QDesktopServices, QShortcut, QKeySequence
@@ -253,8 +253,281 @@ class AutoIndexWorker(QThread):
             except Exception as e:
                 logger.error(f"Error auto-indexing {file_path}: {e}")
                 self.file_indexed.emit(file_path.name, 'error')
-        
+
         self._running = False
+
+
+# ---------------------------------------------------------------------------
+# Help / Contact widgets (ported 1:1 from the Mac app — see Mac main_window.py
+# search for help_button, _position_help_button, _show_help_dialog).
+# Backend is the Supabase Edge Function `send-contact`; nothing to deploy.
+# ---------------------------------------------------------------------------
+
+class HelpSendWorker(QThread):
+    """Background thread that POSTs the contact form to send-contact.
+
+    urllib.request blocks for up to 15s on a slow network; running it on the
+    GUI thread would freeze the dialog. The worker emits one of two signals
+    so the dialog can swap to the confirmation card or surface the error
+    inline.
+    """
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, url: str, payload: dict):
+        super().__init__()
+        self.url = url
+        self.payload = payload
+
+    def run(self):
+        import urllib.request
+        import urllib.error
+        try:
+            data = json.dumps(self.payload).encode("utf-8")
+            req = urllib.request.Request(
+                self.url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body) if body else {}
+            except Exception:
+                parsed = {"ok": False, "error": "Invalid server response"}
+            if parsed.get("ok"):
+                self.finished_ok.emit(parsed)
+            else:
+                self.failed.emit(parsed.get("error") or "Failed to send message")
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+                parsed = json.loads(err_body)
+                msg = parsed.get("error") or f"Server error (HTTP {e.code})"
+            except Exception:
+                msg = f"Server error (HTTP {e.code})"
+            self.failed.emit(msg)
+        except urllib.error.URLError as e:
+            self.failed.emit(f"Network error: {e.reason}")
+        except Exception as e:
+            self.failed.emit(f"Could not send message: {e}")
+
+
+class HelpDialog(QDialog):
+    """Need help? form. Posts to {SUPABASE_URL}/functions/v1/send-contact."""
+
+    INPUT_CSS = """
+        QLineEdit, QTextEdit {
+            background-color: palette(base);
+            border: 1px solid palette(mid);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: palette(text);
+            font-size: 13px;
+        }
+        QLineEdit:focus, QTextEdit:focus { border: 1px solid #7C4DFF; }
+    """
+
+    SEND_BUTTON_CSS = """
+        QPushButton {
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 14px;
+            padding: 10px 28px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                        stop:0 #B28BFF, stop:1 #6D28D9);
+        }
+        QPushButton:hover  { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                          stop:0 #C29FFF, stop:1 #7E3CE9); }
+        QPushButton:disabled { background: #BDBDBD; color: #EEEEEE; }
+    """
+
+    def __init__(self, parent=None, default_email: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Help")
+        self.setMinimumSize(440, 460)
+        self._worker = None
+
+        # Endpoint built lazily so the import doesn't fire at module import time.
+        from app.core.supabase_client import SUPABASE_URL
+        self._endpoint = f"{SUPABASE_URL}/functions/v1/send-contact"
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 24, 28, 24)
+        outer.setSpacing(14)
+
+        # ------- Title + subtitle -------
+        self.title_label = QLabel("Need help?")
+        self.title_label.setStyleSheet(
+            "font-size: 20px; font-weight: 600; color: palette(text);"
+        )
+        outer.addWidget(self.title_label)
+
+        self.subtitle_label = QLabel(
+            "Send us a message and we'll get back to you, usually within 24 hours."
+        )
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setStyleSheet(
+            "font-size: 13px; color: palette(mid);"
+        )
+        outer.addWidget(self.subtitle_label)
+
+        outer.addSpacing(4)
+
+        # ------- Form container (so we can hide/show as a block) -------
+        self.form_container = QWidget()
+        form_layout = QVBoxLayout(self.form_container)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(12)
+
+        label_css = "font-size: 12px; font-weight: 600; color: palette(text);"
+
+        # Name (optional)
+        name_label = QLabel("Name (optional)")
+        name_label.setStyleSheet(label_css)
+        form_layout.addWidget(name_label)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Damianos")
+        self.name_input.setStyleSheet(self.INPUT_CSS)
+        self.name_input.setMinimumHeight(38)
+        form_layout.addWidget(self.name_input)
+
+        # Email
+        email_label = QLabel("Email")
+        email_label.setStyleSheet(label_css)
+        form_layout.addWidget(email_label)
+        self.email_input = QLineEdit()
+        self.email_input.setPlaceholderText("you@example.com")
+        self.email_input.setStyleSheet(self.INPUT_CSS)
+        self.email_input.setMinimumHeight(38)
+        if default_email:
+            self.email_input.setText(default_email)
+        form_layout.addWidget(self.email_input)
+
+        # Message
+        msg_label = QLabel("Message")
+        msg_label.setStyleSheet(label_css)
+        form_layout.addWidget(msg_label)
+        self.message_input = QTextEdit()
+        self.message_input.setPlaceholderText("Describe your issue or question…")
+        self.message_input.setStyleSheet(self.INPUT_CSS)
+        self.message_input.setMinimumHeight(120)
+        form_layout.addWidget(self.message_input)
+
+        # Inline error (hidden by default — never use QMessageBox)
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet(
+            "color: #E53935; font-size: 12px; font-weight: 500;"
+        )
+        self.error_label.setWordWrap(True)
+        self.error_label.setVisible(False)
+        form_layout.addWidget(self.error_label)
+
+        # Send button row
+        send_row = QHBoxLayout()
+        send_row.addStretch()
+        self.send_button = QPushButton("Send message")
+        self.send_button.setCursor(Qt.PointingHandCursor)
+        self.send_button.setStyleSheet(self.SEND_BUTTON_CSS)
+        self.send_button.setMinimumHeight(40)
+        self.send_button.clicked.connect(self._on_send_clicked)
+        send_row.addWidget(self.send_button)
+        form_layout.addLayout(send_row)
+
+        outer.addWidget(self.form_container)
+
+        # ------- Confirmation card (built lazily; shown on success) -------
+        self.confirmation_container = None
+
+    # ----- Validation + send -----
+    def _on_send_clicked(self):
+        name = self.name_input.text().strip()
+        email = self.email_input.text().strip()
+        message = self.message_input.toPlainText().strip()
+
+        if "@" not in email:
+            return self._show_error("Please enter a valid email address.")
+        if len(message) < 10:
+            return self._show_error("Please include a message of at least 10 characters.")
+
+        self.error_label.setVisible(False)
+        self.send_button.setEnabled(False)
+        self.send_button.setText("Sending…")
+
+        payload = {"name": name, "email": email, "message": message}
+        self._worker = HelpSendWorker(self._endpoint, payload)
+        self._worker.finished_ok.connect(self._on_send_ok)
+        self._worker.failed.connect(self._on_send_failed)
+        self._worker.start()
+
+    def _show_error(self, msg: str):
+        self.error_label.setText(msg)
+        self.error_label.setVisible(True)
+
+    def _on_send_ok(self, payload: dict):
+        try:
+            self._show_confirmation(self.email_input.text().strip())
+        finally:
+            self._worker = None
+
+    def _on_send_failed(self, error: str):
+        self._show_error(error)
+        self.send_button.setEnabled(True)
+        self.send_button.setText("Send message")
+        self._worker = None
+
+    # ----- Confirmation card -----
+    def _show_confirmation(self, email: str):
+        # Replace the form with a compact confirmation card and shrink the
+        # dialog so the confirmation doesn't sit in a huge empty box.
+        self.form_container.setVisible(False)
+        self.title_label.setVisible(False)
+        self.subtitle_label.setVisible(False)
+
+        self.confirmation_container = QWidget()
+        conf_layout = QVBoxLayout(self.confirmation_container)
+        conf_layout.setContentsMargins(0, 0, 0, 0)
+        conf_layout.setSpacing(10)
+
+        heading = QLabel("✓ Message sent")
+        heading.setStyleSheet(
+            "color: #2E7D32; font-size: 16px; font-weight: 600;"
+        )
+        heading.setAlignment(Qt.AlignCenter)
+        conf_layout.addWidget(heading)
+
+        body = QLabel(
+            f"Thanks — we'll reply to {email} within 24 hours."
+        )
+        body.setStyleSheet("color: palette(text); font-size: 13px;")
+        body.setAlignment(Qt.AlignCenter)
+        body.setWordWrap(True)
+        conf_layout.addWidget(body)
+
+        conf_layout.addSpacing(4)
+
+        done_row = QHBoxLayout()
+        done_row.addStretch()
+        done_btn = QPushButton("Done")
+        done_btn.setCursor(Qt.PointingHandCursor)
+        done_btn.setStyleSheet(self.SEND_BUTTON_CSS)
+        done_btn.setMinimumHeight(34)
+        done_btn.clicked.connect(self.accept)
+        done_row.addWidget(done_btn)
+        done_row.addStretch()
+        conf_layout.addLayout(done_row)
+
+        # Add to the outer layout
+        self.layout().addWidget(self.confirmation_container)
+
+        # Shrink the dialog so the confirmation isn't a tiny message in a
+        # huge empty box (matches the Mac behaviour).
+        self.setMinimumSize(0, 0)
+        self.resize(420, 220)
 
 
 class MainWindow(QMainWindow):
@@ -675,6 +948,7 @@ class MainWindow(QMainWindow):
         """Setup the clean Search page with hero heading and modern search bar."""
         search_page = QWidget()
         search_page.setObjectName("searchPage")
+        self.search_page = search_page  # kept so the help button can be parented + repositioned
         page_layout = QVBoxLayout(search_page)
         page_layout.setContentsMargins(40, 0, 40, 20)
         page_layout.setSpacing(0)
@@ -869,7 +1143,76 @@ class MainWindow(QMainWindow):
         
         # Add page to stack
         self.page_stack.addWidget(search_page)
-    
+
+        # Floating "💬 Need help?" button — only on the Search page so it
+        # doesn't overlap controls on other pages. Anchored to bottom-right
+        # via a resizeEvent hook (the page itself owns no layout slot for it).
+        self._setup_help_button()
+
+        original_resize = search_page.resizeEvent
+        def _search_page_resize(event):
+            original_resize(event)
+            self._position_help_button()
+        search_page.resizeEvent = _search_page_resize
+
+    def _setup_help_button(self):
+        """Create the floating round purple 💬 button anchored to the
+        bottom-right of the Search page.
+
+        Parented to ``self.search_page`` so the button is only visible while
+        Search is the active page (switching pages in the QStackedWidget
+        hides the whole sub-tree). Positioning is handled by
+        :meth:`_position_help_button` via the page's resizeEvent.
+        """
+        self.help_button = QPushButton("💬", self.search_page)
+        self.help_button.setFixedSize(56, 56)
+        self.help_button.setCursor(Qt.PointingHandCursor)
+        self.help_button.setToolTip("Need help? Contact support")
+        self.help_button.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #B28BFF, stop:1 #6D28D9);
+                color: white;
+                border: none;
+                border-radius: 28px;
+                font-size: 20px;
+                padding: 0 0 2px 0;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #C29FFF, stop:1 #7E3CE9);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #9F75FF, stop:1 #5B1FC9);
+            }
+        """)
+        self.help_button.clicked.connect(self._show_help_dialog)
+        self.help_button.raise_()
+        self._position_help_button()
+
+    def _position_help_button(self):
+        """Anchor the help button 24px from the right and bottom edges of
+        the Search page. Called on every page resize."""
+        if not hasattr(self, "help_button") or self.help_button is None:
+            return
+        if not hasattr(self, "search_page") or self.search_page is None:
+            return
+        page_width = self.search_page.width()
+        page_height = self.search_page.height()
+        x = page_width - self.help_button.width() - 24
+        y = page_height - self.help_button.height() - 24
+        self.help_button.move(max(0, x), max(0, y))
+
+    def _show_help_dialog(self):
+        """Open the Need help? dialog, pre-filling the email when signed in."""
+        try:
+            default_email = supabase_auth.user_email or ""
+        except Exception:
+            default_email = ""
+        dialog = HelpDialog(self, default_email=default_email)
+        dialog.exec()
+
     def setup_index_page(self):
         """Setup the Index Management page with clean drop zone and View Files button."""
         from PySide6.QtWidgets import QScrollArea
