@@ -956,10 +956,36 @@ class OnboardingOverlay(QDialog):
             }}
         """)
     
+    # Telemetry slugs — MUST match the order of ``self.steps``. Used by
+    # _update_step / _finish_tour / _remind_later to label the step in the
+    # ``onboarding_step_viewed`` / ``onboarding_dismissed`` events.
+    _STEP_SLUGS = [
+        "welcome", "smart_search", "organize_files",
+        "auto_organize", "index_files", "settings", "ready",
+    ]
+
     def _update_step(self):
         """Update the UI for the current step"""
+        # Telemetry: emit before any UI updates so we record the view even
+        # if a downstream render bug throws.
+        try:
+            from app.core.supabase_client import track
+            slug = (
+                self._STEP_SLUGS[self.current_step]
+                if self.current_step < len(self._STEP_SLUGS)
+                else "unknown"
+            )
+            track(
+                "onboarding_step_viewed",
+                step=slug,
+                step_index=self.current_step,
+                total_steps=len(self.steps),
+            )
+        except Exception:
+            pass
+
         step = self.steps[self.current_step]
-        
+
         # Update labels
         self.step_label.setText(f"Step {self.current_step + 1} of {len(self.steps)}")
         self.title_label.setText(step["title"])
@@ -1085,13 +1111,35 @@ class OnboardingOverlay(QDialog):
     
     def _remind_later(self):
         """Remind the user later instead of skipping entirely"""
+        try:
+            from app.core.supabase_client import track
+            slug = (
+                self._STEP_SLUGS[self.current_step]
+                if self.current_step < len(self._STEP_SLUGS)
+                else "unknown"
+            )
+            track(
+                "onboarding_dismissed",
+                step=slug,
+                step_index=self.current_step,
+                total_steps=len(self.steps),
+            )
+        except Exception:
+            pass
+
         if self.spotlight:
             self.spotlight.hide()
         self.remind_later.emit()
         self.reject()
-    
+
     def _finish_tour(self):
         """Complete the onboarding with celebration"""
+        try:
+            from app.core.supabase_client import track
+            track("onboarding_completed", total_steps=len(self.steps))
+        except Exception:
+            pass
+
         self.continue_btn.hide()
         if self.spotlight:
             self.spotlight.hide()

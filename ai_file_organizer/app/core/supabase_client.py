@@ -810,3 +810,72 @@ def get_latest_app_version() -> Optional[Dict[str, Any]]:
 
 # Global instance
 supabase_auth = SupabaseAuth()
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: track() helper
+# ---------------------------------------------------------------------------
+# Fire-and-forget writer for the ``app_events`` table. Every call:
+#   - runs on a daemon thread so the GUI is never blocked
+#   - swallows every exception (telemetry must not crash the app or surface
+#     errors if Supabase is unreachable / RLS rejects / the schema changes)
+#
+# The Mac app uses the same signature; keep parity if you change either.
+
+def track(event_name: str, sync_wait_seconds: float = 0.0, **props) -> None:
+    """Insert an ``app_events`` row asynchronously.
+
+    Args:
+        event_name: short snake_case identifier (e.g. ``app_opened``).
+        sync_wait_seconds: when > 0, the caller blocks up to this many
+            seconds waiting for the POST to land. Used by close/shutdown
+            paths (``session_ended``) where the daemon thread would
+            otherwise be killed when the process exits before the POST
+            completes. Defaults to 0 (pure fire-and-forget).
+        **props: arbitrary key/values stored as JSON in the ``props`` column.
+
+    Behaviour:
+        - Never blocks the caller (unless ``sync_wait_seconds`` is set).
+        - Never raises. Any failure is logged at DEBUG level and silently
+          dropped — telemetry is best-effort.
+        - ``platform`` is hard-coded to ``"win"``. ``user_id`` is only sent
+          when the user is currently authenticated.
+    """
+    import threading
+
+    def _send():
+        try:
+            db = supabase_auth._get_db_client()
+            if db is None:
+                return
+            try:
+                from app.version import VERSION as _app_version
+            except Exception:
+                _app_version = None
+
+            row: Dict[str, Any] = {
+                "platform": "win",
+                "event_name": event_name,
+                "props": props or {},
+            }
+            if _app_version:
+                row["app_version"] = _app_version
+
+            user = supabase_auth.current_user
+            if user and user.get("id"):
+                row["user_id"] = user["id"]
+
+            db.from_("app_events").insert(row).execute()
+        except Exception as e:
+            logger.debug(f"track({event_name}) silently dropped: {e}")
+
+    try:
+        thread = threading.Thread(target=_send, daemon=True)
+        thread.start()
+        if sync_wait_seconds > 0:
+            # join() respects the timeout — if the POST doesn't finish in
+            # time we still let the caller proceed (e.g. so the window
+            # actually closes promptly even on flaky networks).
+            thread.join(timeout=sync_wait_seconds)
+    except Exception as e:
+        logger.debug(f"track({event_name}) thread launch failed: {e}")

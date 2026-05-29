@@ -576,7 +576,21 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         """Handle window show event - show onboarding on first launch"""
         super().showEvent(event)
-        
+
+        # ---- Telemetry: app_opened (fires once per process) -------------
+        # Also stash a start time so closeEvent can emit session_ended with
+        # an accurate wall-clock duration. Re-shows of the main window do
+        # not re-fire either event.
+        if not getattr(self, "_app_opened_fired", False):
+            self._app_opened_fired = True
+            try:
+                import time as _time
+                self._session_started_at = _time.time()
+                from app.core.supabase_client import track
+                track("app_opened")
+            except Exception:
+                pass
+
         # Apply dark/light title bar now that the window has a valid HWND
         theme_manager._apply_windows_titlebar(theme_manager.current_theme)
         
@@ -598,7 +612,33 @@ class MainWindow(QMainWindow):
         
         # Check for updates in background (delay to not slow startup)
         QTimer.singleShot(3000, self._check_for_updates)
-    
+
+    def closeEvent(self, event):
+        """Window close — emit session_ended telemetry, then default close.
+
+        Only fires for authenticated users (matches Mac behaviour); the
+        wall-clock duration is computed from the start time stashed in
+        showEvent. Wrapped in a blanket try/except so a telemetry failure
+        never blocks the window from closing.
+        """
+        try:
+            import time as _time
+            start = getattr(self, "_session_started_at", None)
+            if start:
+                from app.core.supabase_client import track, supabase_auth
+                if supabase_auth.is_authenticated:
+                    # sync_wait_seconds blocks briefly so the POST has time
+                    # to land before the process exits (daemon threads get
+                    # killed when the Qt loop exits in super().closeEvent).
+                    track(
+                        "session_ended",
+                        sync_wait_seconds=2.0,
+                        duration_seconds=int(_time.time() - start),
+                    )
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def _show_onboarding(self):
         """Display the onboarding overlay"""
         try:
