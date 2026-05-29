@@ -2467,7 +2467,14 @@ class HistoryDialog(QDialog):
             formatted_date = dt.strftime("%b %d, %Y at %I:%M %p")
         except:
             formatted_date = timestamp_str[:19] if timestamp_str else "Unknown date"
-        
+
+        is_reverted = bool(item.get("reverted", False))
+
+        # Date row carries an optional "Reverted" badge inline so the user
+        # can spot already-undone operations at a glance.
+        date_row = QHBoxLayout()
+        date_row.setSpacing(8)
+
         date_label = QLabel(formatted_date)
         date_label.setStyleSheet(f"""
             font-family: "Segoe UI", sans-serif;
@@ -2477,10 +2484,27 @@ class HistoryDialog(QDialog):
             background: transparent;
             border: none;
         """)
-        info_layout.addWidget(date_label)
-        
+        date_row.addWidget(date_label)
+
+        if is_reverted:
+            reverted_badge = QLabel("Reverted")
+            reverted_badge.setStyleSheet("""
+                font-family: "Segoe UI", sans-serif;
+                font-size: 10px;
+                font-weight: 600;
+                color: white;
+                background: #9E9E9E;
+                border-radius: 4px;
+                padding: 2px 6px;
+            """)
+            date_row.addWidget(reverted_badge)
+
+        date_row.addStretch()
+        info_layout.addLayout(date_row)
+
         files_count = item.get("successful_moves", item.get("total_files", 0))
-        details_label = QLabel(f"{files_count} file(s) organized")
+        reverted_suffix = " (reverted)" if is_reverted else ""
+        details_label = QLabel(f"{files_count} file(s) organized{reverted_suffix}")
         details_label.setStyleSheet(f"""
             font-family: "Segoe UI", sans-serif;
             font-size: 12px;
@@ -2528,6 +2552,7 @@ class HistoryDialog(QDialog):
             
             moves = log_data.get("moves", [])
             renamed = log_data.get("renamed_files", [])
+            is_reverted = bool(log_data.get("reverted", False))
             
             # Create a custom scrollable details dialog
             dialog = QDialog(self)
@@ -2653,8 +2678,36 @@ class HistoryDialog(QDialog):
             
             # Footer
             footer = QHBoxLayout()
+
+            # Revert button — moves files back to their original locations.
+            # Disabled (replaced by a label) once a successful revert has
+            # already been applied so the same operation can't be undone
+            # twice from disk.
+            if is_reverted:
+                reverted_label = QLabel("✓ Already Reverted")
+                reverted_label.setStyleSheet("""
+                    font-family: "Segoe UI", sans-serif;
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: #9E9E9E;
+                    padding: 8px 16px;
+                """)
+                footer.addWidget(reverted_label)
+            else:
+                revert_btn = QPushButton("↩ Revert")
+                revert_btn.setMinimumHeight(40)
+                revert_btn.setCursor(Qt.PointingHandCursor)
+                revert_btn.setStyleSheet("""
+                    QPushButton { background: transparent; color: #7C4DFF; border: 2px solid #7C4DFF; border-radius: 10px;
+                                  font-weight: 600; font-size: 14px; padding: 8px 24px; }
+                    QPushButton:hover { background: #7C4DFF; color: white; }
+                """)
+                revert_btn.setToolTip("Move all files back to their original locations")
+                revert_btn.clicked.connect(lambda: self._revert_organization(log_file, moves, dialog))
+                footer.addWidget(revert_btn)
+
             footer.addStretch()
-            
+
             ok_btn = QPushButton("Close")
             ok_btn.setMinimumHeight(40)
             ok_btn.setCursor(Qt.PointingHandCursor)
@@ -2695,11 +2748,157 @@ class HistoryDialog(QDialog):
                 details=[str(e)]
             )
     
+    def _revert_organization(self, log_file: str, moves: list, details_dialog: QDialog):
+        """Move files back to their original (`from`) paths, undoing the
+        organization recorded in ``log_file``.
+
+        Behaviour matches the Mac implementation:
+        1. Partition the recorded moves into can-revert / cannot-revert
+           buckets — a move can only be reverted if the destination still
+           exists AND the original source location is free.
+        2. Confirm with the user, showing the partition counts.
+        3. For each revertible move, ``shutil.move`` the file back and
+           update the DB row's path via update_file_path_by_old_path.
+        4. Mark the log file ``reverted: true`` so the history badge +
+           "Already Reverted" label show next time.
+        5. Refresh the history list.
+        """
+        from pathlib import Path
+        import shutil
+
+        logger.info(f"[REVERT] Starting revert for {len(moves)} moves from {log_file}")
+
+        if not moves:
+            ModernInfoDialog.show_info(
+                self,
+                title="Nothing to Revert",
+                message="No file moves to revert."
+            )
+            return
+
+        can_revert = []
+        cannot_revert = []
+        for move in moves:
+            dest_path = Path(move.get("to", ""))
+            source_path = Path(move.get("from", ""))
+            if not dest_path.exists():
+                cannot_revert.append(f"File not found: {dest_path.name}")
+            elif source_path.exists():
+                cannot_revert.append(f"Original location occupied: {source_path.name}")
+            else:
+                can_revert.append(move)
+
+        if not can_revert:
+            details_list = cannot_revert[:5]
+            if len(cannot_revert) > 5:
+                details_list.append(f"... and {len(cannot_revert) - 5} more issues")
+            ModernInfoDialog.show_warning(
+                self,
+                title="Cannot Revert",
+                message="Cannot revert this organization.",
+                details=details_list
+            )
+            return
+
+        # Confirmation
+        warning_details = []
+        if cannot_revert:
+            warning_details.append(f"{len(cannot_revert)} file(s) cannot be reverted (moved or deleted)")
+        warning_details.append(f"{len(can_revert)} file(s) will be moved back to original locations")
+
+        confirmed = ModernConfirmDialog.ask(
+            self,
+            title="Confirm Revert",
+            message=f"Move {len(can_revert)} file(s) back to original locations?",
+            details=warning_details,
+            yes_text="Revert",
+            no_text="Cancel"
+        )
+        if not confirmed:
+            return
+
+        # Perform the revert
+        reverted = 0
+        errors = []
+        for move in can_revert:
+            dest_path = Path(move.get("to", ""))
+            source_path = Path(move.get("from", ""))
+            try:
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dest_path), str(source_path))
+                reverted += 1
+                logger.info(f"[REVERT] Moved back: {dest_path.name} -> {source_path.parent.name}/")
+                # Best-effort DB sync — if the file isn't tracked, that's fine.
+                try:
+                    if file_index.update_file_path_by_old_path(str(dest_path), str(source_path)):
+                        logger.info(f"[REVERT] DB path updated: {dest_path.name}")
+                    else:
+                        logger.debug(f"[REVERT] DB path update skipped (file not in DB): {dest_path.name}")
+                except Exception as db_err:
+                    logger.warning(f"[REVERT] DB path update failed for {dest_path.name}: {db_err}")
+            except Exception as e:
+                errors.append(f"{dest_path.name}: {str(e)}")
+
+        # Close the details dialog before showing the result
+        try:
+            details_dialog.accept()
+        except Exception:
+            pass
+
+        logger.info(
+            f"[REVERT] Completed: {reverted} reverted, {len(errors)} errors, "
+            f"{len(cannot_revert)} skipped"
+        )
+
+        if errors:
+            tail = ([f"... and {len(errors) - 5} more errors"] if len(errors) > 5 else [])
+            ModernInfoDialog.show_warning(
+                self,
+                title="Revert Partially Completed",
+                message=f"Reverted {reverted} of {len(can_revert)} files.",
+                details=errors[:5] + tail
+            )
+        else:
+            ModernInfoDialog.show_info(
+                self,
+                title="Revert Complete",
+                message=f"Successfully moved {reverted} file(s) back to original locations.",
+                details=["Files have been restored to their original locations"]
+            )
+
+        # Mark the log file as reverted so the badge + "Already Reverted"
+        # state shows the next time the dialog opens.
+        if reverted > 0:
+            try:
+                import json as _json
+                from datetime import datetime as _dt
+                with open(log_file, 'r', encoding='utf-8') as fh:
+                    log_data = _json.load(fh)
+                log_data['reverted'] = True
+                log_data['reverted_count'] = reverted
+                log_data['reverted_at'] = _dt.now().isoformat()
+                with open(log_file, 'w', encoding='utf-8') as fh:
+                    _json.dump(log_data, fh, indent=2)
+                logger.info(f"[REVERT] Marked log as reverted: {log_file}")
+            except Exception as e:
+                logger.warning(f"[REVERT] Could not mark log as reverted: {e}")
+
+        self._refresh_history()
+
+    def _refresh_history(self):
+        """Reload the history list after a revert (or any external change)."""
+        while self.history_layout.count() > 0:
+            item = self.history_layout.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.deleteLater()
+        self._load_history()
+
     def _clear_history(self):
         """Clear all history log files."""
         from app.core.settings import settings
         import shutil
-        
+
         confirmed = ModernConfirmDialog.ask(
             self,
             title="Clear History",

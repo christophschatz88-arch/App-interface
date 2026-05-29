@@ -275,11 +275,35 @@ class FileIndex:
         except Exception as e:
             logger.error(f"Error updating file path for {file_id}: {e}")
             return False
-    
+
+    def update_file_path_by_old_path(self, old_path: str, new_path: str) -> bool:
+        """Update a file's path when we only know its CURRENT (old) path.
+
+        Used by the Revert flow on the Organize page: we know the move we
+        applied earlier (from-path → to-path), and we want to move the
+        file's DB row back from to-path → from-path. We don't track DB ids
+        in the move log, so we look the row up by its current path.
+
+        Returns True only when the row was found AND updated.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM files WHERE file_path = ?", (old_path,))
+                row = cursor.fetchone()
+                if not row:
+                    logger.debug(f"update_file_path_by_old_path: no row at {old_path}")
+                    return False
+                file_id = row[0]
+        except Exception as e:
+            logger.error(f"update_file_path_by_old_path lookup failed for {old_path}: {e}")
+            return False
+        return self.update_file_path(file_id, new_path)
+
     def delete_file(self, file_id: int) -> bool:
         """
         Delete a file entry from the database.
-        
+
         Args:
             file_id: The ID of the file to delete
             

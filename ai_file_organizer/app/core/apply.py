@@ -187,7 +187,8 @@ def get_move_history() -> List[Dict[str, Any]]:
                     "log_file": str(log_file),
                     "timestamp": log_data.get("timestamp", ""),
                     "total_files": log_data.get("total_files", 0),
-                    "successful_moves": len(log_data.get("moves", []))
+                    "successful_moves": len(log_data.get("moves", [])),
+                    "reverted": log_data.get("reverted", False),
                 })
                 
             except Exception as e:
