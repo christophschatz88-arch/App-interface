@@ -473,7 +473,17 @@ Examples:
 
 Propose an organization plan. Return JSON only."""
     else:
-        # Manual organization (non-auto) with user instruction (or empty instruction)
+        # Manual organization (non-auto) with user instruction (or empty instruction).
+        #
+        # Note: the NESTED-FOLDER SYNTAX rule below is added to the user
+        # message for manual modes only (not the shared SYSTEM_PROMPT).
+        # Without it, when the user asks for a 2-level structure (e.g.
+        # "create everything else and inside that a folder called cartoons")
+        # the AI sometimes emits a dict inside a folder's file_id list
+        # (e.g. {"everything else": [{"cartoons":[83]}, 67, 68, ...]}).
+        # That's not valid per our schema, and the malformed entry causes
+        # the affected file to be silently dropped by plan_to_moves.
+        # Spelling out the syntax with an example fixes it.
         if user_instruction and user_instruction.strip():
             user_message = f"""User instruction: "{user_instruction}"
 
@@ -488,6 +498,24 @@ CRITICAL RULES:
 - You MUST include EVERY file_id in your response ({len(files)} total)
 - Every file_id must appear exactly once in your response
 - NEVER return empty folders
+
+NESTED-FOLDER SYNTAX (max 2 levels):
+- To create a nested folder, put a forward slash IN THE FOLDER NAME.
+- USE THE EXACT FOLDER NAMES THE USER TYPED — do not change capitalisation, pluralisation, or spelling. If the user wrote "Cartoon", use "Cartoon", not "cartoons" or "Cartoons".
+- Every folder's value MUST be a flat list of integer file_ids — never a dict, never a nested object.
+- Generic correct shape (use the user's actual names, not these placeholders):
+{{
+  "folders": {{
+    "<parent>": [<id>, <id>, ...],
+    "<parent>/<child>": [<id>]
+  }}
+}}
+- WRONG (do NOT do this — putting a dict inside the file_id list silently drops the affected files):
+{{
+  "folders": {{
+    "<parent>": [{{"<child>": [<id>]}}, <id>, <id>, ...]
+  }}
+}}
 
 Propose an organization plan. Return JSON only."""
         else:
@@ -512,6 +540,11 @@ CRITICAL RULES:
 - You MUST include EVERY file_id in your response ({len(files)} total)
 - Each file_id must appear in exactly ONE folder
 - Create 2-5 folders depending on how the files naturally group
+
+NESTED-FOLDER SYNTAX (max 2 levels):
+- To create a nested folder, put a forward slash IN THE FOLDER NAME (e.g. "Photos/Vacation").
+- Every folder's value MUST be a flat list of integer file_ids — never a dict, never a nested object.
+- Correct shape: {{"folders": {{"<parent>": [<id>,<id>], "<parent>/<child>": [<id>]}}}}
 
 Propose an organization plan. Return JSON only."""
 

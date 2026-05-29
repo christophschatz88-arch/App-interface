@@ -199,9 +199,16 @@ class IndexBeforeOrganizeWorker(QThread):
                     raise InterruptedError("Indexing cancelled by user")
                 self.progress.emit(current, total, message)
             
+            # MUST be recursive: the "New Files Detected" detector
+            # (_check_for_unindexed_files) uses os.walk to find unindexed
+            # files at ANY depth in the destination folder tree. If we only
+            # index the top level here, the detector keeps re-firing on the
+            # same subfolder files every time the user clicks Generate Plan,
+            # creating an infinite "Index Now" → popup → "Index Now" → popup
+            # loop. Matching the detector's recursion fixes it.
             stats = search_service.index_directory(
                 self.folder_path,
-                recursive=False,  # Only top-level files
+                recursive=True,
                 progress_cb=progress_callback
             )
             
@@ -7183,31 +7190,100 @@ class OrganizePage(QWidget):
         self.plan_tree.itemCollapsed.connect(self._on_folder_collapsed)
         
         folders = plan.get("folders", {})
-        
-        for folder_name, file_ids in sorted(folders.items()):
-            # Add expand arrow prefix - starts collapsed
-            folder_item = QTreeWidgetItem([f"▶  📁 {folder_name}  ({len(file_ids)} files)"])
-            folder_item.setExpanded(False)  # Start collapsed
-            folder_item.setData(0, Qt.UserRole, {"type": "folder", "name": folder_name})
-            
-            display_limit = 25
-            for i, fid in enumerate(file_ids[:display_limit]):
+
+        # Build a nested tree from slash-paths. A plan folder named
+        # "everything else/cartoons" should be rendered as a child of
+        # "everything else", not as a sibling. We also auto-create empty
+        # intermediate parents when the AI returned a child folder without
+        # the parent in the plan (e.g. only "Photos/Vacation" but no
+        # "Photos") — that intermediate gets shown as a folder with no
+        # files of its own, just the child folder below it.
+        display_limit = 25
+
+        # Folder path (forward-slash, lower-cased only for keying) -> QTreeWidgetItem
+        path_to_item: dict = {}
+
+        def _make_folder_item(full_path: str, own_file_ids: list) -> QTreeWidgetItem:
+            leaf_name = full_path.rsplit('/', 1)[-1]
+            label = f"▶  📁 {leaf_name}  ({len(own_file_ids)} files)"
+            item = QTreeWidgetItem([label])
+            item.setExpanded(False)
+            item.setData(0, Qt.UserRole, {"type": "folder", "name": full_path})
+
+            for fid in own_file_ids[:display_limit]:
                 try:
                     fid_int = int(fid)
                     file_info = self.files_by_id.get(fid_int, {})
                     fname = file_info.get("file_name", f"id:{fid}")
-                    file_item = QTreeWidgetItem([fname])  # No icon, just filename
+                    file_item = QTreeWidgetItem([fname])
                     file_item.setData(0, Qt.UserRole, {"type": "file", "id": fid_int})
-                    folder_item.addChild(file_item)
-                except:
+                    item.addChild(file_item)
+                except Exception:
                     pass
-            
-            if len(file_ids) > display_limit:
-                more_item = QTreeWidgetItem([f"+ {len(file_ids) - display_limit} more files..."])
+
+            if len(own_file_ids) > display_limit:
+                more_item = QTreeWidgetItem([f"+ {len(own_file_ids) - display_limit} more files..."])
                 more_item.setDisabled(True)
-                folder_item.addChild(more_item)
-            
-            self.plan_tree.addTopLevelItem(folder_item)
+                item.addChild(more_item)
+            return item
+
+        # Sort folder paths by depth so we always create the parent before
+        # the child. Forward-slash is the canonical separator inside the
+        # plan; back-slashes get normalised for safety.
+        def _depth(p: str) -> int:
+            return p.replace('\\', '/').count('/')
+
+        sorted_folder_paths = sorted(folders.keys(), key=lambda p: (_depth(p), p.lower()))
+
+        for folder_path in sorted_folder_paths:
+            file_ids = folders.get(folder_path) or []
+            norm_path = folder_path.replace('\\', '/').strip('/')
+            if not norm_path:
+                continue
+
+            # Ensure every ancestor exists in the tree as a (possibly empty)
+            # folder item.
+            parts = norm_path.split('/')
+            for i in range(1, len(parts)):
+                ancestor_path = '/'.join(parts[:i])
+                if ancestor_path not in path_to_item:
+                    ancestor_item = _make_folder_item(ancestor_path, [])
+                    path_to_item[ancestor_path] = ancestor_item
+                    parent_path = '/'.join(parts[:i - 1]) if i > 1 else ''
+                    if parent_path and parent_path in path_to_item:
+                        path_to_item[parent_path].addChild(ancestor_item)
+                    else:
+                        self.plan_tree.addTopLevelItem(ancestor_item)
+
+            if norm_path in path_to_item:
+                # Pre-created as an empty ancestor; now backfill its files.
+                existing = path_to_item[norm_path]
+                # Replace the label with the real file count and attach the
+                # file children.
+                leaf_name = norm_path.rsplit('/', 1)[-1]
+                existing.setText(0, f"▶  📁 {leaf_name}  ({len(file_ids)} files)")
+                for fid in file_ids[:display_limit]:
+                    try:
+                        fid_int = int(fid)
+                        file_info = self.files_by_id.get(fid_int, {})
+                        fname = file_info.get("file_name", f"id:{fid}")
+                        file_item = QTreeWidgetItem([fname])
+                        file_item.setData(0, Qt.UserRole, {"type": "file", "id": fid_int})
+                        existing.addChild(file_item)
+                    except Exception:
+                        pass
+                if len(file_ids) > display_limit:
+                    more_item = QTreeWidgetItem([f"+ {len(file_ids) - display_limit} more files..."])
+                    more_item.setDisabled(True)
+                    existing.addChild(more_item)
+            else:
+                new_item = _make_folder_item(norm_path, file_ids)
+                path_to_item[norm_path] = new_item
+                parent_path = '/'.join(parts[:-1])
+                if parent_path and parent_path in path_to_item:
+                    path_to_item[parent_path].addChild(new_item)
+                else:
+                    self.plan_tree.addTopLevelItem(new_item)
         
         summary = get_plan_summary(plan, self.files_by_id)
         
@@ -7919,36 +7995,91 @@ Caption: {file_info.get('caption', 'none')}
     def _delete_folders(self, folder_paths: list) -> int:
         """
         Delete the specified folders. Returns count of successfully deleted folders.
-        Deletes in order (deepest first to handle nested folders).
+
+        After deleting an empty folder, walk UP and delete any parent that just
+        became empty as a result. Without this second step, an intermediate
+        empty folder (e.g. `technology-photography/` when its only child
+        `technology-photography/laptop/` was just removed) gets left behind
+        because the initial scan ran before any deletion happened — so the
+        parent wasn't empty at scan time.
         """
         deleted_count = 0
-        
-        # Sort by depth (deepest first)
+        deleted_set: set = set()
+
         sorted_paths = sorted(folder_paths, key=lambda p: len(Path(p).parts), reverse=True)
-        
+
         _METADATA_FILES = {'.DS_Store', '.localized', 'Thumbs.db', 'desktop.ini'}
 
-        for folder_path in sorted_paths:
-            try:
-                folder = Path(folder_path)
-                if folder.exists() and folder.is_dir():
-                    # Remove metadata files so they don't block deletion
-                    for meta in folder.iterdir():
-                        if meta.name in _METADATA_FILES and meta.is_file():
-                            meta.unlink(missing_ok=True)
+        # Safety guard: never walk above the destination folder (or above
+        # depth 3 if we don't know the destination yet).
+        try:
+            dest_root = self.destination_path.resolve() if self.destination_path else None
+        except Exception:
+            dest_root = None
 
-                    real_contents = [p for p in folder.iterdir() if p.name not in _METADATA_FILES]
-                    if not real_contents:
-                        folder.rmdir()
-                        deleted_count += 1
-                        logger.info(f"Deleted empty folder: {folder}")
-                    else:
-                        logger.warning(f"Folder not empty, skipping: {folder}")
+        def _try_delete(folder: Path) -> bool:
+            try:
+                if not folder.exists() or not folder.is_dir():
+                    return False
+                # Refuse to delete the destination root itself or anything
+                # OUTSIDE it. We allow anything INSIDE the destination, where
+                # dest_root appears in folder.parents.
+                if dest_root is not None:
+                    try:
+                        resolved = folder.resolve()
+                        if resolved == dest_root:
+                            return False
+                        if dest_root not in resolved.parents:
+                            return False
+                    except Exception:
+                        # If resolution fails for any reason, fall through to
+                        # the content check; rmdir is safe on non-empty dirs.
+                        pass
+                # Hidden meta files (.DS_Store etc.) shouldn't block deletion.
+                for meta in folder.iterdir():
+                    if meta.name in _METADATA_FILES and meta.is_file():
+                        try:
+                            meta.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                real_contents = [p for p in folder.iterdir() if p.name not in _METADATA_FILES]
+                if real_contents:
+                    logger.debug(f"Folder not empty, skipping: {folder}")
+                    return False
+                folder.rmdir()
+                logger.info(f"Deleted empty folder: {folder}")
+                return True
             except OSError as e:
-                logger.warning(f"Could not delete folder {folder_path}: {e}")
+                logger.warning(f"Could not delete folder {folder}: {e}")
+                return False
             except Exception as e:
-                logger.error(f"Error deleting folder {folder_path}: {e}")
-        
+                logger.error(f"Error deleting folder {folder}: {e}")
+                return False
+
+        for folder_path in sorted_paths:
+            folder = Path(folder_path)
+            if folder in deleted_set:
+                continue
+            if _try_delete(folder):
+                deleted_count += 1
+                deleted_set.add(folder)
+                # Walk UP and clean any parent that just became empty.
+                parent = folder.parent
+                while True:
+                    if parent in deleted_set:
+                        break
+                    if dest_root is not None:
+                        try:
+                            if parent.resolve() == dest_root:
+                                break
+                        except Exception:
+                            break
+                    if not _try_delete(parent):
+                        break
+                    deleted_count += 1
+                    deleted_set.add(parent)
+                    parent = parent.parent
+
         return deleted_count
     
     def _cleanup_empty_folders(self):
