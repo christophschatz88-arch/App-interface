@@ -3,19 +3,198 @@ Authentication dialog for login, signup, and subscription management.
 Modern, clean design that adapts to dark/light theme.
 """
 
+import json
 import logging
+import socket
+import threading
+import urllib.parse
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QStackedWidget, QWidget, QMessageBox, QFrame,
     QGraphicsDropShadowEffect, QSpacerItem, QSizePolicy
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve, QByteArray, QSize
+from PySide6.QtGui import QFont, QColor, QIcon, QPixmap, QPainter
 
 from app.core.supabase_client import supabase_auth
 from app.core.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth loopback (RFC 8252) constants + helpers.
+#
+# Architecture (do NOT replace with a custom-scheme handler — we tried that
+# on Mac for 5+ hours and it doesn't work reliably from packaged Python apps):
+#
+#   click → bind 127.0.0.1:53682 → open default browser to Supabase OAuth URL
+#   with redirect_to=http://127.0.0.1:53682/callback → Google sign-in →
+#   Supabase redirects to 127.0.0.1:53682/callback#tokens → we serve a tiny
+#   HTML page with JS that reads window.location.hash and POSTs the tokens
+#   to /tokens on the same loopback → polling QTimer sees the tokens,
+#   installs the session, shuts the server down, brings Filect to the front.
+# ---------------------------------------------------------------------------
+
+GOOGLE_OAUTH_PORT = 53682
+GOOGLE_OAUTH_CALLBACK_PATH = "/callback"
+GOOGLE_OAUTH_TOKENS_PATH = "/tokens"
+GOOGLE_OAUTH_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes total deadline
+
+# Inline Google "G" SVG (official branded mark) — rendered to a QIcon below.
+_GOOGLE_G_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+<path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"/>
+<path fill="#FF3D00" d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"/>
+<path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"/>
+<path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303c-.792 2.237-2.231 4.166-4.087 5.571.001-.001.002-.001.003-.002l6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"/>
+</svg>"""
+
+
+def _make_google_icon(size: int = 22) -> QIcon:
+    """Render the Google G SVG into a QIcon. Falls back to an empty icon if
+    QtSvg is unavailable so the button is still functional text-only."""
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+        renderer = QSvgRenderer(QByteArray(_GOOGLE_G_SVG))
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pix)
+    except Exception as e:
+        logger.debug(f"Google G icon render failed: {e}")
+        return QIcon()
+
+
+# Tiny HTML+JS page served at /callback. Tokens arrive in the URL fragment
+# (Supabase OAuth uses fragment-mode for implicit-flow returns), so the
+# server itself can't see them — only the browser can. The JS reads
+# window.location.hash, posts to /tokens on the same loopback, then shows a
+# friendly "you can close this tab" message.
+_OAUTH_CALLBACK_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Signing in to Filect</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+         background: #f6f5f7; color: #222; min-height: 100vh; margin: 0;
+         display:flex; align-items:center; justify-content:center; text-align:center; }
+  .card { background: white; border-radius: 16px; padding: 36px 48px;
+          box-shadow: 0 4px 24px rgba(0,0,0,0.08); max-width: 360px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 8px; color: #2E7D32; }
+  p  { font-size: 14px; color: #555; line-height: 1.5; margin: 0; }
+</style></head><body>
+<div class="card">
+  <h1 id="title">Signing in…</h1>
+  <p id="msg">Just a moment.</p>
+</div>
+<script>
+(function() {
+  var hash = window.location.hash || "";
+  if (hash.charAt(0) === "#") hash = hash.substring(1);
+  var params = {};
+  hash.split("&").forEach(function(part) {
+    if (!part) return;
+    var idx = part.indexOf("=");
+    var k = idx === -1 ? part : part.substring(0, idx);
+    var v = idx === -1 ? ""   : part.substring(idx + 1);
+    params[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\\+/g, " "));
+  });
+  fetch("/tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params)
+  }).then(function() {
+    document.getElementById("title").textContent = "✓ You're signed in";
+    document.getElementById("msg").textContent = "You can close this tab and return to Filect.";
+  }).catch(function() {
+    document.getElementById("title").textContent = "Sign-in problem";
+    document.getElementById("msg").textContent = "Please return to Filect and try again.";
+  });
+})();
+</script></body></html>"""
+
+
+class _ReuseHTTPServer(HTTPServer):
+    """``HTTPServer`` with ``allow_reuse_address`` so back-to-back sign-ins
+    don't fail to bind while the previous socket is still in ``TIME_WAIT``
+    (~60s on Windows). Also needed on Linux/macOS."""
+    allow_reuse_address = True
+
+
+# Module-level flag: set to True when an OAuth flow has just completed
+# successfully, so the next MainWindow.showEvent knows it needs to wrestle
+# focus away from the browser. MainWindow consumes (reads + clears) the
+# flag; AuthDialog only sets it. We use a class-attribute instead of a
+# module-level global so the value lives next to the dialog code.
+
+def force_window_to_foreground(widget):
+    """Bring ``widget`` to the Windows foreground, bypassing Windows'
+    focus-stealing protection.
+
+    Windows blocks ``SetForegroundWindow`` from a process that doesn't
+    currently own the foreground (e.g. our Python process while the
+    browser is showing the OAuth result). The standard workaround is:
+
+    1. Attach our thread's input queue to the foreground thread (the
+       browser). This makes Windows treat us as if we were the
+       foreground process for the duration of the attachment.
+    2. Briefly flip to ``HWND_TOPMOST`` and back to ``HWND_NOTOPMOST`` —
+       this physically hoists the window above the browser without
+       leaving it permanently always-on-top.
+    3. Then ``SetForegroundWindow`` lands.
+
+    Detaches the input queue at the end so we don't keep stealing
+    keystrokes from whichever app was foreground before.
+
+    Pure no-op if any step throws (telemetry-style — focus is a nicety
+    and must never crash the calling code).
+    """
+    try:
+        from ctypes import windll, c_ulong, byref
+        hwnd = int(widget.winId())
+
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+
+        fg_hwnd = windll.user32.GetForegroundWindow()
+        my_thread = windll.kernel32.GetCurrentThreadId()
+        fg_thread = 0
+        attached = False
+        if fg_hwnd:
+            pid = c_ulong(0)
+            fg_thread = windll.user32.GetWindowThreadProcessId(fg_hwnd, byref(pid))
+
+        try:
+            if fg_thread and fg_thread != my_thread:
+                attached = bool(windll.user32.AttachThreadInput(fg_thread, my_thread, True))
+
+            # Briefly topmost → not-topmost flip hoists us above the
+            # browser without keeping us always-on-top.
+            windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            windll.user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+            windll.user32.SetForegroundWindow(hwnd)
+            try:
+                widget.raise_()
+                widget.activateWindow()
+            except Exception:
+                pass
+        finally:
+            if attached:
+                windll.user32.AttachThreadInput(fg_thread, my_thread, False)
+    except Exception as e:
+        logger.debug(f"force_window_to_foreground failed: {e}")
+        try:
+            widget.raise_()
+            widget.activateWindow()
+        except Exception:
+            pass
 
 
 class EmailConfirmationDialog(QDialog):
@@ -562,10 +741,23 @@ class AuthDialog(QDialog):
     # Signals
     auth_successful = Signal()
     
+    # Cross-window flag: set to True when an OAuth flow has just completed
+    # successfully. The next MainWindow.showEvent reads + clears it and
+    # forces foreground if True. We need this because by the time the
+    # auth dialog accepts and MainWindow is created+shown, Windows has
+    # often handed foreground back to the browser, so MainWindow would
+    # otherwise appear hidden behind the browser tab.
+    _pending_foreground_after_oauth = False
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Filect")
-        self.setFixedSize(460, 680)
+        # 720px fits the email + password + Sign In + or-divider + Continue
+        # with Google + footer on the login page without clipping the
+        # magnifying-glass logo at the top, even on smaller laptop screens.
+        # We rely on the addStretch() in _create_login_page to absorb any
+        # leftover vertical space cleanly.
+        self.setFixedSize(460, 720)
         self.setWindowFlags(Qt.Dialog | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         self.setModal(True)
         self.setObjectName("authDialog")
@@ -587,18 +779,27 @@ class AuthDialog(QDialog):
         super().showEvent(event)
         from app.ui.theme_manager import apply_titlebar_theme
         apply_titlebar_theme(self)
+        # Always reset the Google button when the dialog re-opens — without
+        # this, signing out and re-showing the dialog leaves the button
+        # stuck on "Waiting for Google sign-in…" if a previous attempt was
+        # mid-flight when the dialog last closed.
+        if hasattr(self, "google_button"):
+            self._reset_google_button()
     
     def _setup_ui(self):
         """Set up the dialog UI."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        
-        # Main container with card styling
+
+        # Main container with card styling. Reduced vertical padding from 40
+        # → 24 so the login page (which now has an extra row for Google)
+        # fits in 720px without Qt squeezing the email/password input
+        # containers below their min height.
         self.container = QFrame()
         self.container.setObjectName("authContainer")
         container_layout = QVBoxLayout(self.container)
-        container_layout.setContentsMargins(48, 40, 48, 40)
+        container_layout.setContentsMargins(40, 24, 40, 24)
         container_layout.setSpacing(0)
         
         # Header with logo
@@ -624,7 +825,7 @@ class AuthDialog(QDialog):
         header_layout.addWidget(self.subtitle_label)
         
         container_layout.addLayout(header_layout)
-        container_layout.addSpacing(32)
+        container_layout.addSpacing(20)  # was 32 — tightened to fit Google row
         
         # Stacked widget for different views
         self.stack = QStackedWidget()
@@ -670,7 +871,10 @@ class AuthDialog(QDialog):
         page.setObjectName("authPage")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(20)
+        # 12px row spacing (down from 20) — with 10+ rows, 20px of spacing
+        # between each adds up to ~200px and pushes the page beyond what a
+        # 720px dialog can show without clipping the input containers.
+        layout.setSpacing(12)
         
         # Email field
         email_container, self.login_email = self._create_input_field(
@@ -692,7 +896,64 @@ class AuthDialog(QDialog):
         self.login_button.setMinimumHeight(52)
         self.login_button.setCursor(Qt.PointingHandCursor)
         layout.addWidget(self.login_button)
-        
+
+        # "or" divider between the email/password form and the Google button.
+        or_row = QHBoxLayout()
+        or_row.setSpacing(12)
+        or_line_left = QFrame()
+        or_line_left.setFrameShape(QFrame.HLine)
+        or_line_left.setObjectName("authDivider")
+        or_line_left.setFixedHeight(1)
+        or_line_right = QFrame()
+        or_line_right.setFrameShape(QFrame.HLine)
+        or_line_right.setObjectName("authDivider")
+        or_line_right.setFixedHeight(1)
+        or_label = QLabel("or")
+        or_label.setObjectName("authSwitchLabel")
+        or_label.setAlignment(Qt.AlignCenter)
+        or_row.addWidget(or_line_left, 1)
+        or_row.addWidget(or_label, 0)
+        or_row.addWidget(or_line_right, 1)
+        layout.addSpacing(6)
+        layout.addLayout(or_row)
+        layout.addSpacing(6)
+
+        # Continue with Google button (loopback OAuth, see _sign_in_with_google).
+        self.google_button = QPushButton("  Continue with Google")
+        self.google_button.setObjectName("googleButton")
+        self.google_button.setMinimumHeight(52)
+        self.google_button.setCursor(Qt.PointingHandCursor)
+        self.google_button.setIcon(_make_google_icon(22))
+        self.google_button.setIconSize(QSize(22, 22))
+        # Inline styling so we don't need to touch the global QSS — keeps
+        # the white-bg / dark-text Google branding consistent in both
+        # light and dark themes.
+        self.google_button.setStyleSheet("""
+            QPushButton#googleButton {
+                background-color: white;
+                color: #1F1F1F;
+                border: 1px solid #DADCE0;
+                border-radius: 12px;
+                font-size: 15px;
+                font-weight: 500;
+                padding: 0 16px;
+                text-align: center;
+            }
+            QPushButton#googleButton:hover {
+                background-color: #F8F9FA;
+                border-color: #C8CDD3;
+            }
+            QPushButton#googleButton:pressed {
+                background-color: #F1F3F4;
+            }
+            QPushButton#googleButton:disabled {
+                background-color: #F5F5F5;
+                color: #9E9E9E;
+                border-color: #E0E0E0;
+            }
+        """)
+        layout.addWidget(self.google_button)
+
         # Error label
         self.login_error = QLabel("")
         self.login_error.setObjectName("errorLabel")
@@ -700,7 +961,7 @@ class AuthDialog(QDialog):
         self.login_error.setWordWrap(True)
         self.login_error.setMinimumHeight(24)
         layout.addWidget(self.login_error)
-        
+
         # Forgot password link
         forgot_layout = QHBoxLayout()
         forgot_layout.addStretch()
@@ -973,6 +1234,7 @@ class AuthDialog(QDialog):
         self.login_password.returnPressed.connect(self._do_login)
         self.to_signup_button.clicked.connect(self._go_to_signup)
         self.forgot_password_btn.clicked.connect(self._show_forgot_password)
+        self.google_button.clicked.connect(self._sign_in_with_google)
 
         # Signup page
         self.signup_button.clicked.connect(self._do_signup)
@@ -1007,7 +1269,7 @@ class AuthDialog(QDialog):
         self.title_label.setText("File Search Assistant")
         self.subtitle_label.setText("Sign in to your account")
         self.stack.setCurrentIndex(0)
-        self.setFixedSize(460, 680)
+        self.setFixedSize(460, 720)  # fits Continue with Google on laptop screens
 
     def _go_to_verify(self, email):
         """Show the code-verification page after signup."""
@@ -1105,7 +1367,300 @@ class AuthDialog(QDialog):
         else:
             error = result.get('error', 'Login failed')
             self.login_error.setText(error)
-    
+
+    # ----- Google OAuth (loopback flow) ---------------------------------
+
+    def _sign_in_with_google(self):
+        """Entry point for the 'Continue with Google' button.
+
+        Spins up a one-shot HTTP server on 127.0.0.1:53682, opens the
+        default browser to Supabase's Google OAuth URL with redirect_to
+        pointing at our loopback, then polls (via QTimer on the main
+        thread) for the tokens that the browser will POST back via
+        :data:`_OAUTH_CALLBACK_HTML`. See the module-level docstring for
+        the full architecture.
+
+        Click semantics:
+        - Idle state → start the flow (show "✕ Cancel sign-in" label).
+        - In-progress state → cancel the flow (close server, reset button).
+          This is the recovery path when the user closes the browser tab
+          before completing sign-in; without it they'd be stuck staring
+          at "Waiting…" for the full 5-minute timeout.
+        """
+        from app.core.supabase_client import SUPABASE_URL
+
+        # A click while a flow is in progress = the user wants to cancel.
+        if getattr(self, "_google_oauth_in_progress", False):
+            self._cancel_google_signin()
+            return
+
+        # Pre-flight bind check on a throwaway socket — gives us a clean
+        # error message if the port is genuinely taken by another app,
+        # without leaking a half-started server.
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            test_sock.bind(("127.0.0.1", GOOGLE_OAUTH_PORT))
+        except OSError as e:
+            self.login_error.setText(
+                f"Couldn't start sign-in (port {GOOGLE_OAUTH_PORT} in use). Try again in a minute."
+            )
+            logger.error(f"[GOOGLE] Pre-flight bind failed: {e}")
+            test_sock.close()
+            return
+        finally:
+            try:
+                test_sock.close()
+            except Exception:
+                pass
+
+        # Reset per-attempt state. ``_google_tokens`` is the shared mailbox
+        # between the HTTP handler thread (writer) and the main-thread
+        # QTimer (reader). Plain attribute assignment is fine here — we
+        # only care about visibility of the final reference, and the GIL
+        # gives us that.
+        self._google_tokens = None
+
+        callback_url = f"http://127.0.0.1:{GOOGLE_OAUTH_PORT}{GOOGLE_OAUTH_CALLBACK_PATH}"
+        # prompt=select_account forces Google to always show the account
+        # chooser, even when the browser is already signed into exactly one
+        # Google account. Supabase /auth/v1/authorize forwards the ``prompt``
+        # query param straight to the provider's authorize URL.
+        oauth_url = (
+            f"{SUPABASE_URL}/auth/v1/authorize?provider=google"
+            f"&redirect_to={urllib.parse.quote(callback_url, safe='')}"
+            f"&prompt=select_account"
+        )
+        logger.info(f"[GOOGLE] Starting loopback OAuth, callback={callback_url}")
+
+        dialog_self = self  # captured by the inner Handler
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                # Silence the noisy default access log — we have our own.
+                pass
+
+            def do_GET(self):
+                if self.path.startswith(GOOGLE_OAUTH_CALLBACK_PATH):
+                    body = _OAUTH_CALLBACK_HTML.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                if self.path == GOOGLE_OAUTH_TOKENS_PATH:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(length).decode("utf-8", errors="replace")
+                    try:
+                        payload = json.loads(raw) if raw else {}
+                    except Exception:
+                        payload = {}
+                    # Hand off to the main-thread poller.
+                    dialog_self._google_tokens = payload
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        try:
+            self._google_server = _ReuseHTTPServer(
+                ("127.0.0.1", GOOGLE_OAUTH_PORT), Handler
+            )
+        except OSError as e:
+            self.login_error.setText(
+                "Couldn't start sign-in server. Try again in a minute."
+            )
+            logger.error(f"[GOOGLE] Server bind failed after pre-flight: {e}")
+            return
+
+        self._google_server_thread = threading.Thread(
+            target=self._google_server.serve_forever, daemon=True
+        )
+        self._google_server_thread.start()
+
+        # Mark the flow in-progress and flip the button into "cancel
+        # mode" — keep it ENABLED so a second click cancels rather than
+        # being a dead click for 5 minutes.
+        self._google_oauth_in_progress = True
+        self.google_button.setEnabled(True)
+        self.google_button.setText("  ✕ Cancel sign-in")
+        self.login_error.setText("")
+
+        try:
+            webbrowser.open(oauth_url)
+        except Exception as e:
+            logger.error(f"[GOOGLE] Could not open browser: {e}")
+            self.login_error.setText("Couldn't open your browser. Try again.")
+            self._stop_google_server()
+            self._reset_google_button()
+            return
+
+        # Poll for tokens at 200ms — gives the JS callback time to land
+        # without a perceptible delay in unlocking the UI.
+        if not hasattr(self, "_google_poll_timer") or self._google_poll_timer is None:
+            self._google_poll_timer = QTimer(self)
+            self._google_poll_timer.timeout.connect(self._google_check_tokens)
+        self._google_poll_timer.start(200)
+
+        # 5-minute total deadline. If the user abandons the browser tab,
+        # we want the button back to a usable state.
+        if not hasattr(self, "_google_timeout_timer") or self._google_timeout_timer is None:
+            self._google_timeout_timer = QTimer(self)
+            self._google_timeout_timer.setSingleShot(True)
+            self._google_timeout_timer.timeout.connect(self._google_timeout)
+        self._google_timeout_timer.start(GOOGLE_OAUTH_TIMEOUT_MS)
+
+    def _google_check_tokens(self):
+        """QTimer callback — runs on the main thread every 200ms.
+
+        Inspects ``self._google_tokens`` (written by the loopback HTTP
+        handler thread) and installs the session if tokens are present.
+        """
+        tokens = self._google_tokens
+        if not tokens:
+            return
+
+        # Stop both timers + server before doing anything that could throw.
+        if hasattr(self, "_google_poll_timer") and self._google_poll_timer is not None:
+            self._google_poll_timer.stop()
+        if hasattr(self, "_google_timeout_timer") and self._google_timeout_timer is not None:
+            self._google_timeout_timer.stop()
+        self._stop_google_server()
+
+        access = tokens.get("access_token")
+        refresh = tokens.get("refresh_token")
+        if not access or not refresh:
+            err = (
+                tokens.get("error_description")
+                or tokens.get("error")
+                or "No tokens received from Google."
+            )
+            logger.error(f"[GOOGLE] Callback returned no tokens: {tokens}")
+            self.login_error.setText(f"Google sign-in failed: {err}")
+            self._reset_google_button()
+            return
+
+        result = supabase_auth.restore_session(access, refresh)
+        if not result.get("success"):
+            self.login_error.setText(
+                f"Couldn't restore Google session: {result.get('error', 'unknown error')}"
+            )
+            logger.error(f"[GOOGLE] restore_session failed: {result}")
+            self._reset_google_button()
+            return
+
+        email = supabase_auth.user_email or ""
+        try:
+            settings.set_auth_tokens(access, refresh, email)
+        except Exception as e:
+            logger.warning(f"[GOOGLE] Could not persist tokens to settings: {e}")
+
+        logger.info(f"[GOOGLE] Sign-in complete: {email}")
+        self._reset_google_button()
+
+        # Bring Filect to the foreground — the user is in their browser
+        # right now and shouldn't have to alt-tab back.
+        self._bring_app_to_foreground()
+
+        # Subscription gate.
+        sub_result = supabase_auth.check_subscription()
+        if sub_result.get("has_subscription"):
+            logger.info("[GOOGLE] Active subscription found — closing auth dialog")
+            self.auth_successful.emit()
+            self.accept()
+        else:
+            # No subscription → auto-open pricing immediately (no extra
+            # click) and keep the dialog open as a polling fallback so it
+            # finishes itself when the purchase completes.
+            logger.info("[GOOGLE] No subscription — opening pricing page")
+            self._show_subscribe_page()
+            try:
+                supabase_auth.open_web_pricing()
+            except Exception as e:
+                logger.error(f"[GOOGLE] open_web_pricing failed: {e}")
+            self._poll_count = 0
+            self._poll_timer.start(3000)
+
+    def _google_timeout(self):
+        """Five-minute deadline elapsed — clean up and tell the user."""
+        logger.warning("[GOOGLE] OAuth flow timed out after 5 minutes")
+        if hasattr(self, "_google_poll_timer") and self._google_poll_timer is not None:
+            self._google_poll_timer.stop()
+        self._stop_google_server()
+        self._reset_google_button()
+        self.login_error.setText("Google sign-in timed out. Try again.")
+
+    def _stop_google_server(self):
+        """Shut down the loopback HTTP server cleanly if it's running."""
+        server = getattr(self, "_google_server", None)
+        if server is None:
+            return
+        try:
+            server.shutdown()
+        except Exception as e:
+            logger.debug(f"[GOOGLE] server.shutdown() raised: {e}")
+        try:
+            server.server_close()
+        except Exception as e:
+            logger.debug(f"[GOOGLE] server.server_close() raised: {e}")
+        self._google_server = None
+
+    def _reset_google_button(self):
+        """Restore the Google button to its idle state. MUST be called
+        from every exit path (success, timeout, error, cancel, dialog
+        show) otherwise the button gets stuck in 'Cancel sign-in' mode
+        and a fresh click would mis-route to ``_cancel_google_signin``.
+        """
+        self._google_oauth_in_progress = False
+        if hasattr(self, "google_button"):
+            self.google_button.setEnabled(True)
+            self.google_button.setText("  Continue with Google")
+
+    def _cancel_google_signin(self):
+        """User-initiated cancel of an in-progress OAuth flow.
+
+        Common trigger: the user closed the browser tab without finishing
+        sign-in, came back to Filect, and clicked the button again. Tears
+        down the loopback server, stops both timers, and resets the
+        button so the next click starts a fresh flow.
+        """
+        logger.info("[GOOGLE] User canceled OAuth flow")
+        if hasattr(self, "_google_poll_timer") and self._google_poll_timer is not None:
+            self._google_poll_timer.stop()
+        if hasattr(self, "_google_timeout_timer") and self._google_timeout_timer is not None:
+            self._google_timeout_timer.stop()
+        self._stop_google_server()
+        self._reset_google_button()
+        # Clear any error left from a previous attempt so the form looks
+        # idle (we don't want a "Google sign-in timed out" message from a
+        # previous click hanging around).
+        if hasattr(self, "login_error"):
+            self.login_error.setText("")
+
+    def _bring_app_to_foreground(self):
+        """Pull the current Filect window to the front after OAuth completes.
+
+        Uses :func:`force_window_to_foreground` for the heavy lifting. Also
+        sets the class-level ``_pending_foreground_after_oauth`` flag so
+        that whatever window is shown next (typically MainWindow, created
+        after this dialog accepts) can repeat the foreground push — by the
+        time the dialog hides, the browser usually has reclaimed
+        foreground and the new MainWindow would otherwise come up hidden
+        behind it.
+        """
+        target = self.parent() if self.parent() is not None else self
+        force_window_to_foreground(target)
+        AuthDialog._pending_foreground_after_oauth = True
+
     def _do_signup(self):
         """Handle signup button click."""
         email = self.signup_email.text().strip()

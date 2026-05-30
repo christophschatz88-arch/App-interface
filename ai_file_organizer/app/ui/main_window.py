@@ -591,6 +591,19 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # ---- Post-OAuth foreground push ---------------------------------
+        # If we just completed Google sign-in (or any other OAuth that left
+        # the user in their browser), Windows will have handed foreground
+        # back to the browser by the time MainWindow appears. Force focus
+        # back to us so the user lands in the app, not the browser tab.
+        try:
+            from app.ui.auth_dialog import AuthDialog, force_window_to_foreground
+            if AuthDialog._pending_foreground_after_oauth:
+                AuthDialog._pending_foreground_after_oauth = False
+                force_window_to_foreground(self)
+        except Exception as e:
+            logger.debug(f"Post-OAuth foreground push failed: {e}")
+
         # Apply dark/light title bar now that the window has a valid HWND
         theme_manager._apply_windows_titlebar(theme_manager.current_theme)
         
