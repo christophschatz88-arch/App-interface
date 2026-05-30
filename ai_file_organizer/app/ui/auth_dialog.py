@@ -42,7 +42,13 @@ logger = logging.getLogger(__name__)
 GOOGLE_OAUTH_PORT = 53682
 GOOGLE_OAUTH_CALLBACK_PATH = "/callback"
 GOOGLE_OAUTH_TOKENS_PATH = "/tokens"
+GOOGLE_OAUTH_PING_PATH = "/ping"
 GOOGLE_OAUTH_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes total deadline
+
+# Marker string returned by the /ping endpoint so a second Filect instance
+# probing the port can recognise "the other end is also Filect" and show a
+# friendlier error message than the generic "port in use".
+FILECT_OAUTH_MARKER = "filect-oauth-loopback-v1"
 
 # Inline Google "G" SVG (official branded mark) — rendered to a QIcon below.
 _GOOGLE_G_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
@@ -1395,18 +1401,32 @@ class AuthDialog(QDialog):
             return
 
         # Pre-flight bind check on a throwaway socket — gives us a clean
-        # error message if the port is genuinely taken by another app,
-        # without leaking a half-started server.
+        # error message if the port is genuinely taken, without leaking
+        # a half-started server.
         test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             test_sock.bind(("127.0.0.1", GOOGLE_OAUTH_PORT))
         except OSError as e:
-            self.login_error.setText(
-                f"Couldn't start sign-in (port {GOOGLE_OAUTH_PORT} in use). Try again in a minute."
-            )
-            logger.error(f"[GOOGLE] Pre-flight bind failed: {e}")
             test_sock.close()
+            # Distinguish "another Filect window" from "unrelated app" via
+            # the /ping marker — the message is way friendlier when we can
+            # tell the user *what* is holding the port.
+            if self._port_is_held_by_filect():
+                self.login_error.setText(
+                    "Another Filect window is signing in with Google. "
+                    "Finish or cancel that one first."
+                )
+                logger.warning(
+                    "[GOOGLE] Pre-flight bind failed — another Filect "
+                    "instance holds the port"
+                )
+            else:
+                self.login_error.setText(
+                    f"Port {GOOGLE_OAUTH_PORT} is in use by another app. "
+                    "Try again in a minute, or close any other apps using it."
+                )
+                logger.error(f"[GOOGLE] Pre-flight bind failed: {e}")
             return
         finally:
             try:
@@ -1441,7 +1461,18 @@ class AuthDialog(QDialog):
                 pass
 
             def do_GET(self):
-                if self.path.startswith(GOOGLE_OAUTH_CALLBACK_PATH):
+                if self.path == GOOGLE_OAUTH_PING_PATH:
+                    # Identity probe — a second Filect instance hitting
+                    # /ping recognises this marker and shows a friendlier
+                    # "another Filect window is signing in" error instead
+                    # of the generic "port in use" message.
+                    body = FILECT_OAUTH_MARKER.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.startswith(GOOGLE_OAUTH_CALLBACK_PATH):
                     body = _OAUTH_CALLBACK_HTML.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1598,6 +1629,31 @@ class AuthDialog(QDialog):
         self._stop_google_server()
         self._reset_google_button()
         self.login_error.setText("Google sign-in timed out. Try again.")
+
+    def _port_is_held_by_filect(self) -> bool:
+        """Probe ``127.0.0.1:53682/ping`` and check for the Filect marker.
+
+        Used after a pre-flight bind failure to tell apart these two cases:
+
+        - **Another Filect window** is mid-sign-in. Their server returns
+          ``FILECT_OAUTH_MARKER`` from ``/ping``. We show "finish the
+          other window first".
+        - **An unrelated app** has the port. Either the connection
+          refuses, times out, or returns different content. We show
+          "try again in a minute".
+
+        Returns False on any probe failure — the caller should treat
+        that as "unrelated app" since we can't prove it's us.
+        """
+        try:
+            import urllib.request
+            url = f"http://127.0.0.1:{GOOGLE_OAUTH_PORT}{GOOGLE_OAUTH_PING_PATH}"
+            with urllib.request.urlopen(url, timeout=1.0) as resp:
+                body = resp.read().decode("utf-8", errors="ignore").strip()
+            return body == FILECT_OAUTH_MARKER
+        except Exception as e:
+            logger.debug(f"[GOOGLE] /ping probe failed (not a Filect server): {e}")
+            return False
 
     def _stop_google_server(self):
         """Shut down the loopback HTTP server cleanly if it's running."""
