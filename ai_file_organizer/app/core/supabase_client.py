@@ -329,10 +329,10 @@ class SupabaseAuth:
             logger.info(f"[SUB CHECK] Query response: {response.data}")
 
             if response.data and len(response.data) > 0:
-                # Prefer an active/trialing subscription; fall back to the most recent row.
+                # Prefer an active/trialing/past_due subscription; fall back to the most recent row.
                 sub = None
                 for s in response.data:
-                    if s.get('status') in ('active', 'trialing'):
+                    if s.get('status') in ('active', 'trialing', 'past_due'):
                         sub = s
                         break
                 if not sub:
@@ -349,7 +349,11 @@ class SupabaseAuth:
                 # trial-end / first-period date and would wrongly flag long-time
                 # active subscribers as expired. Stripe moves truly-ended subs off
                 # 'active'/'trialing', so status is the reliable signal.
-                is_active = status in ('active', 'trialing')
+                # past_due is treated as still-subscribed: Stripe is automatically
+                # retrying the card for up to ~3 weeks. Once Stripe gives up, it
+                # auto-flips the status to canceled, which cuts access naturally.
+                # This matches Spotify / Notion / Slack / Adobe behaviour.
+                is_active = status in ('active', 'trialing', 'past_due')
                 logger.info(f"[SUB CHECK] Status: {status}, current_period_end: {period_end}, has_subscription={is_active}")
 
                 return {
@@ -413,7 +417,7 @@ class SupabaseAuth:
         price_id = self._subscription.get('price_id', '')
         status = self._subscription.get('status', '')
 
-        if status not in ('active', 'trialing'):
+        if status not in ('active', 'trialing', 'past_due'):
             return 'free'
 
         # Unknown-but-active price falls back to 'basic' so the user isn't locked out.
@@ -731,7 +735,7 @@ class SupabaseAuth:
         if not self._subscription:
             self.check_subscription()
         sub = self._subscription or {}
-        if sub.get('price_id') and sub.get('status') in ('active', 'trialing'):
+        if sub.get('price_id') and sub.get('status') in ('active', 'trialing', 'past_due'):
             url += f"&current={sub['price_id']}"
         try:
             webbrowser.open(url)

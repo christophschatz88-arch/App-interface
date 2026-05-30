@@ -3013,8 +3013,16 @@ class MainWindow(QMainWindow):
                     status = result.get('status', 'active')
                     tier = supabase_auth.get_plan_tier()
                     plan_disp = {'basic': 'Basic', 'pro': 'Pro', 'premium': 'Premium'}.get(tier, 'Pro')
-                    # "Free trial until …" while trialing, otherwise "Active until …".
-                    state_word = 'Free trial' if status == 'trialing' else 'Active'
+                    # "Free trial until …" while trialing, "Payment update needed —
+                    # access continues" while past_due (Stripe is auto-retrying the
+                    # card; access stays on until Stripe gives up and flips to
+                    # canceled), otherwise "Active until …".
+                    if status == 'trialing':
+                        state_word = 'Free trial'
+                    elif status == 'past_due':
+                        state_word = 'Payment update needed — access continues'
+                    else:
+                        state_word = 'Active'
                     expires_at = result.get('expires_at', 'N/A')
                     expires_str = None
                     if expires_at and expires_at != 'N/A':
@@ -3023,11 +3031,17 @@ class MainWindow(QMainWindow):
                             expires_str = dt.strftime('%Y-%m-%d')
                         except Exception:
                             expires_str = None
-                    if expires_str:
+                    if status == 'past_due':
+                        # No "until <date>" suffix — the date is misleading while
+                        # Stripe retries; the user just needs to update their card.
+                        self.account_sub_label.setText(f"⚠ {plan_disp} · {state_word}")
+                        self.account_sub_label.setStyleSheet("color: #E65100;")
+                    elif expires_str:
                         self.account_sub_label.setText(f"✓ {plan_disp} · {state_word} until {expires_str}")
+                        self.account_sub_label.setStyleSheet("color: #7C4DFF;")
                     else:
                         self.account_sub_label.setText(f"✓ {plan_disp} · {state_word}")
-                    self.account_sub_label.setStyleSheet("color: #7C4DFF;")
+                        self.account_sub_label.setStyleSheet("color: #7C4DFF;")
                     self.account_plan_label.setText(f"{plan_disp} Plan ✓")
                     self.account_plan_label.setStyleSheet("color: #7C4DFF; font-weight: 500;")
                     # Upgrade button: show for Basic/Pro, hide for Premium (top tier).
