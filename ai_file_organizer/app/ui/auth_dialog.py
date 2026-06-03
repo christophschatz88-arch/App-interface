@@ -1598,21 +1598,28 @@ class AuthDialog(QDialog):
         logger.info(f"[GOOGLE] Sign-in complete: {email}")
         self._reset_google_button()
 
-        # Bring Filect to the foreground — the user is in their browser
-        # right now and shouldn't have to alt-tab back.
-        self._bring_app_to_foreground()
-
-        # Subscription gate.
+        # Subscription gate. The foreground push is deliberately INSIDE the
+        # subscribed branch — for unsubscribed users we're about to open
+        # the pricing page in their browser, and pulling Filect to the
+        # front would steal focus from the page they need to interact
+        # with.
         sub_result = supabase_auth.check_subscription()
         if sub_result.get("has_subscription"):
             logger.info("[GOOGLE] Active subscription found — closing auth dialog")
+            # Subscribed user lands in the main app — yank Filect to the
+            # front so they don't have to alt-tab away from the browser.
+            self._bring_app_to_foreground()
             self.auth_successful.emit()
             self.accept()
         else:
-            # No subscription → auto-open pricing immediately (no extra
-            # click) and keep the dialog open as a polling fallback so it
-            # finishes itself when the purchase completes.
-            logger.info("[GOOGLE] No subscription — opening pricing page")
+            # No subscription → open the pricing page immediately (no
+            # extra click) and keep the dialog open as a polling fallback
+            # so it finishes itself when the purchase completes. We do
+            # NOT call _bring_app_to_foreground here — the user just needs
+            # to pick a plan in the browser, and stealing focus would
+            # make them alt-tab back. The dialog re-shows itself
+            # automatically when the user returns to it.
+            logger.info("[GOOGLE] No subscription — opening pricing page (keeping browser in front)")
             self._show_subscribe_page()
             try:
                 supabase_auth.open_web_pricing()
