@@ -1801,7 +1801,20 @@ class AuthDialog(QDialog):
             self.sub_status.setObjectName("errorLabel")
 
     def _poll_subscription(self):
-        """Poll for subscription status after checkout."""
+        """Poll for subscription status after checkout.
+
+        Two guards against the post-checkout race where a brand-new trial
+        reads as ``trialing`` for ~1 second before the server-side
+        duplicate-card abuse check cancels it and sets
+        ``trial_blocked_reason='duplicate_trial_card'``:
+
+        1. **Hard block on trial_blocked_reason.** If the field is set
+           we know the trial is being torn down — show a clear message
+           and keep polling (so a real paid subscription auto-unlocks).
+        2. **Double-confirm has_subscription.** Don't enter the app on
+           the first sighting. Wait one more poll tick (~3 s) and only
+           accept if it's still subscribed AND not blocked.
+        """
         self._poll_count += 1
 
         # Silent timeout after 30 minutes — reset button, stop polling
@@ -1813,16 +1826,56 @@ class AuthDialog(QDialog):
 
         result = supabase_auth.check_subscription()
 
+        # Guard 1 — trial_blocked_reason means the server has rejected
+        # this trial. Keep polling (in case the user buys a real plan)
+        # but DO NOT let them in. Reset the confirm counter so a flaky
+        # row that later un-sets the flag still has to double-confirm.
+        if result.get('trial_blocked_reason'):
+            self._confirm_count = 0
+            self.sub_status.setText(
+                "This card was already used for a Filect trial. "
+                "Pick a paid plan to continue."
+            )
+            self.sub_status.setObjectName("errorLabel")
+            return
+
+        # Guard 2 — double-confirm. has_subscription must be True for
+        # TWO consecutive polls before we accept. Catches the trialing
+        # → canceled+trial_blocked transition that lands between ticks.
         if result.get('has_subscription'):
+            self._confirm_count = getattr(self, "_confirm_count", 0) + 1
+            if self._confirm_count < 2:
+                self.sub_status.setText("Confirming your subscription…")
+                return
             self._poll_timer.stop()
             self.sub_status.setText("Payment confirmed! 🎉")
-            logger.info("Subscription verified!")
+            logger.info("Subscription verified (double-confirmed)")
             QTimer.singleShot(500, lambda: (self.auth_successful.emit(), self.accept()))
-    
+        else:
+            # Subscription vanished between checks — reset the confirm
+            # counter and keep polling.
+            self._confirm_count = 0
+
     def _check_subscription_silent(self):
         """Check subscription without UI updates."""
         result = supabase_auth.check_subscription()
-        
+
+        # If the trial is server-blocked, route to the subscribe page
+        # with a clear explanation and never accept the dialog. Matches
+        # the rule used at app-start (main.check_existing_session).
+        if result.get('trial_blocked_reason'):
+            logger.warning(
+                f"[AUTH] Trial blocked ({result.get('trial_blocked_reason')}) — "
+                "routing to subscribe page"
+            )
+            self._show_subscribe_page()
+            self.sub_status.setText(
+                "This card was already used for a Filect trial. "
+                "Pick a paid plan to continue."
+            )
+            self.sub_status.setObjectName("errorLabel")
+            return
+
         if result.get('has_subscription'):
             logger.info("Active subscription found")
             self.auth_successful.emit()

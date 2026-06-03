@@ -343,6 +343,7 @@ class SupabaseAuth:
 
                 status = sub.get('status')
                 period_end = sub.get('current_period_end')
+                trial_blocked_reason = sub.get('trial_blocked_reason')
                 # Trust the Stripe status as the source of truth. We deliberately do
                 # NOT expire the user based on current_period_end: the webhook does
                 # not refresh that field each billing cycle, so it holds the original
@@ -353,17 +354,31 @@ class SupabaseAuth:
                 # retrying the card for up to ~3 weeks. Once Stripe gives up, it
                 # auto-flips the status to canceled, which cuts access naturally.
                 # This matches Spotify / Notion / Slack / Adobe behaviour.
-                is_active = status in ('active', 'trialing', 'past_due')
-                logger.info(f"[SUB CHECK] Status: {status}, current_period_end: {period_end}, has_subscription={is_active}")
+                #
+                # trial_blocked_reason gating: when the server-side abuse check
+                # (duplicate-card detection, etc.) sets this field, the trial is
+                # being torn down even if `status` still reads 'trialing' for a
+                # second or two. Treat ANY row with a non-null trial_blocked_reason
+                # as NOT subscribed — no matter what Stripe status says — so the
+                # post-checkout poll race can't slip the user into the app during
+                # the gap between "trialing" and "canceled".
+                is_active = status in ('active', 'trialing', 'past_due') and not trial_blocked_reason
+                logger.info(
+                    f"[SUB CHECK] Status: {status}, "
+                    f"current_period_end: {period_end}, "
+                    f"trial_blocked_reason: {trial_blocked_reason}, "
+                    f"has_subscription={is_active}"
+                )
 
                 return {
                     'has_subscription': is_active,
                     'status': status,
-                    'expires_at': period_end
+                    'expires_at': period_end,
+                    'trial_blocked_reason': trial_blocked_reason,
                 }
             else:
                 logger.warning(f"[SUB CHECK] No subscription found for user_id: {user_id}")
-                return {'has_subscription': False, 'status': None}
+                return {'has_subscription': False, 'status': None, 'trial_blocked_reason': None}
                 
         except Exception as e:
             error_msg = str(e)

@@ -182,6 +182,12 @@ def check_existing_session():
     """
     Check if there's a valid stored session with active subscription.
     Returns True if user can skip login, False otherwise.
+
+    A user whose subscription has ``trial_blocked_reason`` set (the
+    server-side abuse check rejected their trial — typically duplicate
+    card) is NEVER allowed past this gate, even if a stale Stripe
+    status briefly reads as 'trialing'. Without this guard a flagged
+    user could bypass the auth dialog by closing + reopening the app.
     """
     if not settings.has_stored_session():
         return False
@@ -196,6 +202,8 @@ def check_existing_session():
         return False
 
     sub_result = supabase_auth.check_subscription()
+    if sub_result.get('trial_blocked_reason'):
+        return False
     return sub_result.get('has_subscription', False)
 
 
